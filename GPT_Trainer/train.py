@@ -12,20 +12,19 @@ except ModuleNotFoundError:
 
 def main():
     # Create the model trainer
-    batch_size=16
+    batch_size=48
     learning_rate=1e-4
     warmup_steps=10_000
     num_steps=1_000_000
     dev="gpu"
-    # wandb_name="softmax_clamp10_2GPU_512seqlen_64bz"
-    wandb_name="softmax_detachsumdim1_gate_outnorm_2GPU_768seqlen_16bz"
+    wandb_name="gated3_softmax_48bs_2gpu_786seqlen"
     log_steps=10
     use_amp=True
-    attention_type="cos" # cos or soft
+    attention_type="gated_softmax"
     mlp_type="normal" # gelu or normal
     clipping_value=None
     weight_decay=0.01
-    model_save_path = "models/softmax_detachsumdim1_gate_outnorm_2GPU_768seqlen_16bz"
+    model_save_path = "models/gated3_softmax_48bs_2gpu_786seqlen"
     # model_save_path = "models/del"
     num_save_steps = 1_000
     keep_dataset_in_mem = False
@@ -33,7 +32,7 @@ def main():
     
     # Load in a checkpoint
     load_checkpoint = False
-    checkpoint_path = "models/softmax_detachsumdim1_gate_outnorm_2GPU_768seqlen_16bz/"
+    checkpoint_path = "models/gated3_softmax_48bs_2gpu_786seqlen/"
     
     trainer = Trainer(
         batch_size=batch_size,

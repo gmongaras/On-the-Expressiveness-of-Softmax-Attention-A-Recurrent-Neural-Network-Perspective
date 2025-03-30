@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #SBATCH -A eclarson_protein_diffusion_0001
-#SBATCH --job-name=SM_UwU_Diffusion_^w^
+#SBATCH --job-name=>w<_Gated_Softmax
 #SBATCH -p batch
 ###SBATCH --exclusive
 #SBATCH -o runjob.out
@@ -45,11 +45,12 @@ head_node_ip=$(srun --nodes=1 --ntasks=1 -w "$head_node" hostname --ip-address)
 echo Node IP: $head_node_ip
 export LOGLEVEL=INFO
 
-cd /projects/eclarson/protein_diffusion/gmongaras_diffusion_models/Cottention_Tests
+source ~/.bashrc
+cd /projects/eclarson/protein_diffusion/gmongaras_diffusion_models/Gated_Attention
 CUDA_VISIBLE_DEVICES=0,1 srun /home/gmongaras/miniconda3/bin/torchrun \
 --nnodes $nnodes \
 --nproc_per_node $nproc_per_node \
 --rdzv_id $RANDOM \
 --rdzv_backend c10d \
---rdzv_endpoint $head_node_ip:29515 \
+--rdzv_endpoint $head_node_ip:29525 \
 GPT_Trainer/train.py

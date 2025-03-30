@@ -20,12 +20,10 @@ import torch.distributed as dist
 
 try:
     from GPT_Trainer.multi_gpu_helpers import is_main_process
-    from GPT_Trainer.LlamaDecoderLayer import LlamaDecoderLayer, LlamaMLPGeLU
-    from GPT_Trainer.LlamaDecoderLayer2 import LlamaDecoderLayer2
+    from GPT_Trainer.LlamaDecoderLayer import LlamaDecoderLayer
 except ModuleNotFoundError:
     from multi_gpu_helpers import is_main_process
-    from LlamaDecoderLayer import LlamaDecoderLayer, LlamaMLPGeLU
-    from LlamaDecoderLayer2 import LlamaDecoderLayer2
+    from LlamaDecoderLayer import LlamaDecoderLayer
 
 
 
@@ -212,20 +210,16 @@ class Trainer():
                 "use_cache": True,
                 # "vocab_size": 32000,
                 "vocab_size": self.tokenizer.vocab_size,
+                "attention_type": attention_type,
             }))
             
             
             # Replace all self attention layers with the cosine attention layer
-            if attention_type == "cos":
-                for i, layer in enumerate(self.model.model.layers):
-                    old = layer
-                    self.model.model.layers[i] = LlamaDecoderLayer(self.model.config, layer_idx=i).to(layer.self_attn.q_proj.weight.device)
-                    self.model.model.layers[i].self_attn.layer_num = i
-                    del old
-            elif attention_type == "soft":
-                pass
-            else:
-                raise ValueError("Attention type must be 'cos' or 'soft'")
+            for i, layer in enumerate(self.model.model.layers):
+                old = layer
+                self.model.model.layers[i] = LlamaDecoderLayer(self.model.config, layer_idx=i).to(layer.self_attn.q_proj.weight.device)
+                self.model.model.layers[i].self_attn.layer_num = i
+                del old
                     
                     
                     
@@ -379,7 +373,7 @@ class Trainer():
         # Initialize wandb run
         if is_main_process():
             wandb.init(
-                project="Cottention_Tests",
+                project="Gated_Attention",
                 name=self.wandb_name,
                 notes=None, # May add notes later
                 
@@ -549,57 +543,56 @@ class Trainer():
         self.attention_type = config["attention_type"]
         self.mlp_type = config["mlp_type"]
         
-        # Replace all self attention layers (BertSelfAttention) with the cosine attention layer (GPTCosAttention)
-        if self.attention_type == "cos":
-            for i, layer in enumerate(self.model.model.layers):
-                old = layer
+        # Replace all decoder layers
+        for i, layer in enumerate(self.model.model.layers):
+            old = layer
+            
+            layer = LlamaDecoderLayer(self.model.config).to(layer.self_attn.q_proj.weight.device)
+            layer.self_attn.layer_num = i
+            
+            # Copy weights
+            layer.self_attn.q_proj.weight.data = old.self_attn.q_proj.weight.data
+            if old.self_attn.q_proj.bias is not None:
+                layer.self_attn.q_proj.bias.data = old.self_attn.q_proj.bias.data
+            else:
+                layer.self_attn.q_proj.bias = None
+            layer.self_attn.k_proj.weight.data = old.self_attn.k_proj.weight.data
+            if old.self_attn.k_proj.bias is not None:
+                layer.self_attn.k_proj.bias.data = old.self_attn.k_proj.bias.data
+            else:
+                layer.self_attn.k_proj.bias = None
+            layer.self_attn.v_proj.weight.data = old.self_attn.v_proj.weight.data
+            if old.self_attn.v_proj.bias is not None:
+                layer.self_attn.v_proj.bias.data = old.self_attn.v_proj.bias.data
+            else:
+                layer.self_attn.v_proj.bias = None
+            layer.self_attn.o_proj.weight.data = old.self_attn.o_proj.weight.data
+            if old.self_attn.o_proj.bias is not None:
+                layer.self_attn.o_proj.bias.data = old.self_attn.o_proj.bias.data
+            else:
+                layer.self_attn.o_proj.bias = None
                 
-                layer = LlamaDecoderLayer(self.model.config).to(layer.self_attn.q_proj.weight.device)
-                layer.self_attn.layer_num = i
-                
-                # Copy weights
-                layer.self_attn.q_proj.weight.data = old.self_attn.q_proj.weight.data
-                if old.self_attn.q_proj.bias is not None:
-                    layer.self_attn.q_proj.bias.data = old.self_attn.q_proj.bias.data
-                else:
-                    layer.self_attn.q_proj.bias = None
-                layer.self_attn.k_proj.weight.data = old.self_attn.k_proj.weight.data
-                if old.self_attn.k_proj.bias is not None:
-                    layer.self_attn.k_proj.bias.data = old.self_attn.k_proj.bias.data
-                else:
-                    layer.self_attn.k_proj.bias = None
-                # layer.self_attn.v_proj.weight.data = old.self_attn.v_proj.weight.data
-                # if old.self_attn.v_proj.bias is not None:
-                #     layer.self_attn.v_proj.bias.data = old.self_attn.v_proj.bias.data
-                # else:
-                #     layer.self_attn.v_proj.bias = None
-                layer.self_attn.o_proj.weight.data = old.self_attn.o_proj.weight.data
-                if old.self_attn.o_proj.bias is not None:
-                    layer.self_attn.o_proj.bias.data = old.self_attn.o_proj.bias.data
-                else:
-                    layer.self_attn.o_proj.bias = None
-                    
-                layer.mlp.gate_proj.weight.data = old.mlp.gate_proj.weight.data
-                if old.mlp.gate_proj.bias is not None:
-                    layer.mlp.gate_proj.bias.data = old.mlp.gate_proj.bias.data
-                else:
-                    layer.mlp.gate_proj.bias = None
-                layer.mlp.up_proj.weight.data = old.mlp.up_proj.weight.data
-                if old.mlp.up_proj.bias is not None:
-                    layer.mlp.up_proj.bias.data = old.mlp.up_proj.bias.data
-                else:
-                    layer.mlp.up_proj.bias = None
-                layer.mlp.down_proj.weight.data = old.mlp.down_proj.weight.data
-                if old.mlp.down_proj.bias is not None:
-                    layer.mlp.down_proj.bias.data = old.mlp.down_proj.bias.data
-                else:
-                    layer.mlp.down_proj.bias = None
-                layer.input_layernorm.weight.data = old.input_layernorm.weight.data
-                layer.post_attention_layernorm.weight.data = old.post_attention_layernorm.weight.data
-                
-                self.model.model.layers[i] = layer
-                
-                del old
+            layer.mlp.gate_proj.weight.data = old.mlp.gate_proj.weight.data
+            if old.mlp.gate_proj.bias is not None:
+                layer.mlp.gate_proj.bias.data = old.mlp.gate_proj.bias.data
+            else:
+                layer.mlp.gate_proj.bias = None
+            layer.mlp.up_proj.weight.data = old.mlp.up_proj.weight.data
+            if old.mlp.up_proj.bias is not None:
+                layer.mlp.up_proj.bias.data = old.mlp.up_proj.bias.data
+            else:
+                layer.mlp.up_proj.bias = None
+            layer.mlp.down_proj.weight.data = old.mlp.down_proj.weight.data
+            if old.mlp.down_proj.bias is not None:
+                layer.mlp.down_proj.bias.data = old.mlp.down_proj.bias.data
+            else:
+                layer.mlp.down_proj.bias = None
+            layer.input_layernorm.weight.data = old.input_layernorm.weight.data
+            layer.post_attention_layernorm.weight.data = old.post_attention_layernorm.weight.data
+            
+            self.model.model.layers[i] = layer
+            
+            del old
                 
             # Load extra params if needed
             self.model.load_state_dict(torch.load(checkpoint_path.replace(" ", "_") + "/pytorch_model-00001-of-00002.bin", map_location=self.model.model.layers[0].self_attn.q_proj.weight.device), strict=False)
