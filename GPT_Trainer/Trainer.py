@@ -417,6 +417,25 @@ class Trainer():
                 # Loss
                 loss = loss_fct(outputs.view(-1, self.model_ref.config.vocab_size), labels.view(-1).to(outputs.device))
                 
+                # # Perplexity calculation
+                # # https://huggingface.co/docs/transformers/en/perplexity
+                # with torch.no_grad():
+                #     # loss is calculated using CrossEntropyLoss which averages over valid labels
+                #     # N.B. the model only calculates loss over trg_len - 1 labels, because it internally shifts the labels
+                #     # to the left by 1.
+                #     neg_log_likelihood = torch.nn.functional.nll_loss(
+                #         outputs.view(-1, self.model_ref.config.vocab_size), 
+                #         labels.view(-1).to(outputs.device)
+                #     )
+                #     # Accumulate the total negative log-likelihood and the total number of tokens
+                #     num_valid_tokens = (labels != -100).sum().item()  # number of valid tokens in target_ids
+                #     batch_size = labels.shape[0]
+                #     num_loss_tokens = num_valid_tokens - batch_size  # subtract batch_size due to internal label shift
+                #     nll_sum = neg_log_likelihood * num_loss_tokens
+                #     n_tokens = num_loss_tokens
+                #     avg_nll = nll_sum / n_tokens  # average negative log-likelihood per token
+                #     ppl = torch.exp(avg_nll).cpu().detach().item()
+
             # Backpropagate loss
             if self.use_amp:
                 grad_scaler.scale(loss).backward()

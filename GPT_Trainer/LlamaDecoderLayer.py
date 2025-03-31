@@ -22,10 +22,6 @@ from torch.utils.checkpoint import checkpoint
 
 
 
-if is_torch_flex_attn_available():
-    from torch.nn.attention.flex_attention import BlockMask
-
-    from transformers.integrations.flex_attention import make_flex_block_causal_mask
 
 
 logger = logging.get_logger(__name__)
@@ -294,12 +290,14 @@ class LlamaAttention(nn.Module):
             out_gate = self.out_gate_proj(hidden_states).mT[:, :, :, None].sigmoid()
             in_gate = self.in_gate_proj(hidden_states).mT[:, :, :, None].sigmoid()
 
-            # Divide queries by the sequence length
+            # Mask mask binary and multiplicative instead of addative
             causal_mask = attention_mask.clone()==0
-            query_states = query_states / causal_mask.sum(-1, keepdim=True)
 
             # Attention operation
             attn_output = GatedAttention.apply(query_states.float(), key_states.float(), value_states.float(), out_gate.float(), in_gate.float(), causal_mask)
+
+            # Divide output by the sequence length
+            attn_output = attn_output / causal_mask.sum(-1, keepdim=True)
 
             # Output norm
             attn_output = self.out_norm(attn_output)
