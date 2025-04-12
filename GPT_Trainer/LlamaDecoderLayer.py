@@ -16,15 +16,20 @@ from transformers.utils import (
     logging,
 )
 from transformers.models.llama.configuration_llama import LlamaConfig
-from kernel.Gated_Attn_Test import GatedAttention
+from kernel.Gated_Attn import GatedAttention
 import math
 from torch.utils.checkpoint import checkpoint
+# https://github.com/state-spaces/mamba/issues/706
+from mamba_ssm import Mamba2
+from einops import rearrange
 
 
 
 
 
 logger = logging.get_logger(__name__)
+elu = torch.nn.functional.elu
+relu = torch.nn.functional.relu
 
 
 class LlamaRMSNorm(nn.Module):
@@ -215,33 +220,110 @@ class LlamaAttention(nn.Module):
         self.attention_type = config.attention_type
 
         assert self.attention_type in [
-            "softmax",
-            "softmax_nodenom",
+            "softmax", # Normal softmax
+            "softmax_clamp_denom", # Normal softmax, clamp denominator to be at least one
+            "softmax_detach_denom", # Normal softmax, detach denominator
+            "softmax_detach_denom_gate", # Normal softmax, detach denominator, add a gate
             "gated_softmax",
+            "gated_softmax_no_norm", # Gated softmax, no output norm
+            "gated_softmax_no_in_gate", # Gated softmax, no input/value gate
+            "gated_softmax_no_out_gate", # Gated softmax, no output gate
+            "gated_softmax_no_gate", # Gated softmax, no input or output gate
+            "gated_softmax_plusplus", # Expierment
             "linear_elu",
-            "linear_cosine"
+            "linear_relu",
+            "linear_cosine",
+            "linear_mamba"
         ]
 
-        self.q_proj = nn.Linear(
-            config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.k_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.v_proj = nn.Linear(
-            config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.o_proj = nn.Linear(
-            config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
-        )
+        # Special case for mamba and rwkv
+        if self.attention_type not in [
+                "linear_mamba",
+            ]:
 
-        # Normal softmax doesn't need anything extra
+            if self.attention_type != "gated_softmax_plusplus":
+                self.q_proj = nn.Linear(
+                    config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias
+                )
+                self.k_proj = nn.Linear(
+                    config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+                )
+                self.v_proj = nn.Linear(
+                    config.hidden_size, config.num_key_value_heads * self.head_dim, bias=config.attention_bias
+                )
+            self.o_proj = nn.Linear(
+                config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias
+            )
 
-        # Gated softmax needs two gates and a norm
-        if self.attention_type == "gated_softmax":
-            self.out_gate_proj = nn.Linear(config.hidden_size, config.num_attention_heads, bias=True)
-            self.in_gate_proj = nn.Linear(config.hidden_size, config.num_key_value_heads, bias=True)
-            self.out_norm = nn.LayerNorm(self.head_dim)
+            # Normal softmax doesn't need anything extra
+
+            # For softmax_detach_denom_gate, only a gate on the queries
+            # as that acts like the denominator
+            if self.attention_type == "softmax_detach_denom_gate":
+                self.out_gate_proj = nn.Linear(config.hidden_size, config.num_attention_heads, bias=True)
+                # self.out_norm = nn.LayerNorm(self.head_dim)
+
+            # Gated softmax needs two gates and a norm
+            elif self.attention_type in [
+                    "gated_softmax", 
+                    "gated_softmax_no_norm",
+                    "gated_softmax_no_in_gate",
+                    "gated_softmax_no_out_gate",
+                    "gated_softmax_no_gate",
+                    "gated_softmax_plusplus"
+                ]:
+                if self.attention_type not in ["gated_softmax_no_out_gate", "gated_softmax_no_gate"]:
+                    self.out_gate_proj = nn.Linear(config.hidden_size, config.num_attention_heads, bias=True)
+                if self.attention_type not in ["gated_softmax_no_in_gate", "gated_softmax_no_gate"]:
+                    self.in_gate_proj = nn.Linear(config.hidden_size, config.num_key_value_heads, bias=True)
+                if self.attention_type == "gated_softmax_no_norm":
+                    self.out_norm = nn.Identity()
+                else:
+                    self.out_norm = nn.LayerNorm(self.head_dim)
+
+                # Add a convolution and activation before
+                if self.attention_type == "gated_softmax_plusplus":
+                    # Combine the QKV projections
+                    all_dim = config.num_attention_heads * self.head_dim + 2 * config.num_key_value_heads * self.head_dim
+                    self.q_size = config.num_attention_heads * self.head_dim
+                    self.kv_size = config.num_key_value_heads * self.head_dim
+                    self.qkv_proj = nn.Linear(
+                        config.hidden_size, all_dim, bias=config.attention_bias
+                    )
+
+                    # Post convolution activation function
+                    self.act = "silu"
+
+                    # Input convolution
+                    d_conv = 4
+                    self.conv1d = nn.Conv1d(
+                        in_channels=all_dim,
+                        out_channels=all_dim,
+                        bias=config.attention_bias,
+                        kernel_size=d_conv,
+                        groups=all_dim,
+                        padding=d_conv - 1,
+                    )
+
+                    global causal_conv1d_fn
+                    from causal_conv1d import causal_conv1d_fn
+
+            # Elu does not need anything special'
+
+            # Cosine attention needs the power weights
+            elif self.attention_type == "linear_cosine":
+                self.norm_const = nn.Parameter(0.5*torch.ones(1, config.num_attention_heads, 1, 1, dtype=self.q_proj.weight.dtype)).to(self.q_proj.weight.device)
+
+        else:
+            if self.attention_type == "linear_mamba":
+                self.mamba_layer = Mamba2(
+                    # This module uses roughly 3 * expand * d_model^2 parameters
+                    d_model=config.hidden_size, # Model dimension d_model
+                    d_state=64,  # SSM state expansion factor, typically 64 or 128
+                    d_conv=2,    # Local convolution width
+                    expand=1,    # Block expansion factor
+                    headdim=64,
+                )
 
 
 
@@ -257,10 +339,48 @@ class LlamaAttention(nn.Module):
         input_shape = hidden_states.shape[:-1]
         hidden_shape = (*input_shape, -1, self.head_dim)
 
+
+
+
+
+
+        # Mamba and RWKV
+        if self.attention_type == "linear_mamba":
+            def forwrd_mamba(hidden_states):
+                return self.mamba_layer(hidden_states)
+            
+            attn_output = checkpoint(
+                forwrd_mamba, hidden_states,
+            )
+
+            return attn_output, None
+
+
+
+
+
+
         # Q, K, V projections
-        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        if self.attention_type == "gated_softmax_plusplus":
+            # Combined QKV
+            QKV = self.qkv_proj(hidden_states)
+
+            # Convolution
+            QKV = causal_conv1d_fn(
+                x=QKV.transpose(1, 2),
+                weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                bias=self.conv1d.bias,
+                activation=self.act,
+            ).transpose(1, 2)
+
+            # Get QKV tensors
+            query_states = QKV[:, :, :self.q_size].view(hidden_shape).transpose(1, 2)
+            key_states = QKV[:, :, self.q_size:self.q_size+self.kv_size].view(hidden_shape).transpose(1, 2)
+            value_states = QKV[:, :, self.q_size+self.kv_size:].view(hidden_shape).transpose(1, 2)
+        else:
+            query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+            value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
         # RoPE
         cos, sin = position_embeddings
@@ -284,17 +404,90 @@ class LlamaAttention(nn.Module):
                 **kwargs,
             )
             attn_output = attn_output.transpose(1, 2)
-        elif self.attention_type == "gated_softmax":
-            #"""
+
+        
+        elif self.attention_type in [
+                "softmax_clamp_denom",
+                "softmax_detach_denom",
+            ]:
+            def forwrd_gated(query_states, key_states, value_states, attention_mask):
+                # Inner product
+                attn_weights = query_states @ key_states.mT / math.sqrt(self.head_dim)
+
+                # Add mask
+                attn_weights = attn_weights + attention_mask
+
+                # Exponential
+                attn_weights = attn_weights.exp()
+
+                # Denominator
+                denom = attn_weights.sum(-1, keepdim=True)
+                if self.attention_type == "softmax_clamp_denom":
+                    denom = denom.clamp(min=1)
+                elif self.attention_type == "softmax_detach_denom":
+                    denom = denom.clamp(min=1).detach()
+                attn_weights = attn_weights / denom
+
+                # Output gate
+                return attn_weights @ value_states
+
+            attn_output = checkpoint(
+                forwrd_gated, query_states, key_states, value_states, attention_mask
+            )
+
+
+
+        elif self.attention_type == "softmax_detach_denom_gate":
             # Get extra gates
             out_gate = self.out_gate_proj(hidden_states).mT[:, :, :, None].sigmoid()
-            in_gate = self.in_gate_proj(hidden_states).mT[:, :, :, None].sigmoid()
+
+            def forwrd_gated(query_states, key_states, value_states, out_gate, attention_mask):
+                # Inner product
+                attn_weights = query_states @ key_states.mT / math.sqrt(self.head_dim)
+
+                # Add mask
+                attn_weights = attn_weights + attention_mask
+
+                # Exponential
+                attn_weights = attn_weights.clamp(max=5).exp()
+
+                # Denominator
+                denom = attn_weights.sum(-1, keepdim=True).detach()
+                attn_weights = attn_weights / denom.clamp(min=1)
+
+                # Output and gate
+                return self.out_norm(attn_weights @ value_states) * out_gate
+                # return (attn_weights @ value_states) * out_gate
+
+            attn_output = checkpoint(
+                forwrd_gated, query_states, key_states, value_states, out_gate, attention_mask
+            )
+
+
+        elif self.attention_type in [
+                "gated_softmax", 
+                "gated_softmax_no_norm",
+                "gated_softmax_no_in_gate",
+                "gated_softmax_no_out_gate", 
+                "gated_softmax_no_gate", 
+                "gated_softmax_plusplus"
+            ]:
+            #"""
+            # Get extra gates
+            if self.attention_type not in ["gated_softmax_no_out_gate", "gated_softmax_no_gate"]:
+                out_gate = self.out_gate_proj(hidden_states).mT[:, :, :, None].sigmoid()
+            else:
+                out_gate = torch.ones_like(query_states)[:, :, :, :1]
+            if self.attention_type not in ["gated_softmax_no_in_gate", "gated_softmax_no_gate"]:
+                in_gate = self.in_gate_proj(hidden_states).mT[:, :, :, None].sigmoid()
+            else:
+                in_gate = torch.ones_like(value_states)[:, :, :, :1]
 
             # Mask mask binary and multiplicative instead of addative
             causal_mask = attention_mask.clone()==0
 
             # Attention operation
-            attn_output = GatedAttention.apply(query_states.float(), key_states.float(), value_states.float(), out_gate.float(), in_gate.float(), causal_mask)
+            attn_output = GatedAttention.apply(query_states.float(), key_states.float(), value_states.float(), out_gate.float(), in_gate.float(), causal_mask, self.scaling)
 
             # Divide output by the sequence length
             attn_output = attn_output / causal_mask.sum(-1, keepdim=True)
@@ -308,14 +501,6 @@ class LlamaAttention(nn.Module):
             # Get extra gates
             out_gate = self.out_gate_proj(hidden_states).mT[:, :, :, None].sigmoid()
             in_gate = self.in_gate_proj(hidden_states).mT[:, :, :, None].sigmoid()
-
-            # # Divide queries by the sequence length
-            # causal_mask = attention_mask==0
-            # query_states = query_states / causal_mask.sum(-1, keepdim=True)
-
-            # # Attention operation
-            # attn_output = GatedAttention.apply(query_states, key_states, value_states, out_gate, in_gate, causal_mask)
-            # attn_weights = None
 
             def forwrd_gated(query_states, key_states, value_states, out_gate, in_gate, attention_mask):
                 dtype = query_states.dtype
@@ -346,13 +531,6 @@ class LlamaAttention(nn.Module):
             out_gate = self.out_gate_proj(hidden_states).mT[:, :, :, None].sigmoid()
             in_gate = self.in_gate_proj(hidden_states).mT[:, :, :, None].sigmoid()
 
-            # # Divide queries by the sequence length
-            # causal_mask = attention_mask==0
-            # query_states = query_states / causal_mask.sum(-1, keepdim=True)
-
-            # # Attention operation
-            # attn_output = GatedAttention.apply(query_states, key_states, value_states, out_gate, in_gate, causal_mask)
-            # attn_weights = None
 
             def forwrd_gated(query_states, key_states, value_states, out_gate, in_gate, attention_mask):
                 # Values in gate
@@ -362,15 +540,16 @@ class LlamaAttention(nn.Module):
                 attn_weights = torch.matmul(query_states.float(), key_states.float().transpose(2, 3)) / math.sqrt(self.head_dim)
                 # attn_weights = attn_weights * decay_weights.mT[:, :, None, :]
                 attn_weights = attn_weights.clamp(max=5).exp()
+                # attn_weights = torch.nn.functional.silu(attn_weights.clamp(max=5))
 
                 causal_mask = (attention_mask==0)
                 attn_weights = attn_weights * causal_mask
 
-                attn_weights = attn_weights / causal_mask.sum(-1, keepdim=True)
+                # attn_weights = attn_weights / causal_mask.sum(-1, keepdim=True)
 
                 # Output gate
                 # attn_output = self.out_norm(attn_output)
-                return out_gate * torch.matmul(attn_weights, value_states.float()).to(dtype)
+                return out_gate * torch.matmul(attn_weights, value_states.float()).to(dtype) / causal_mask.sum(-1, keepdim=True)
 
             attn_output = checkpoint(
                 forwrd_gated, query_states, key_states, value_states, out_gate, in_gate, attention_mask
@@ -378,13 +557,133 @@ class LlamaAttention(nn.Module):
 
             attn_output = self.out_norm(attn_output)
             """
+
+
+        elif self.attention_type in ["gated_softmax_decay_sigmoid"]:
+            # Get extra gates
+            out_gate = self.out_gate_proj(hidden_states).mT[:, :, :, None].sigmoid()
+            in_gate = self.in_gate_proj(hidden_states).mT[:, :, :, None].sigmoid()
+            decay_gate = self.decay_gate_proj(hidden_states).mT[:, :, :, None].sigmoid()
+
+
+            def forwrd_gated(query_states, key_states, value_states, out_gate, in_gate, decay_gate, attention_mask):
+                # Cumulative proucts for decay gates
+                decay_gate_cum = decay_gate.repeat(1, 1, 1, key_states.shape[-2]).masked_fill(attention_mask!=0, 1).flip(-1).cumprod(-1).flip(-1)
+                
+                # Values in gate
+                value_states = value_states * in_gate
+
+                dtype = query_states.dtype
+                attn_weights = torch.matmul(query_states.float(), key_states.float().transpose(2, 3)) / math.sqrt(self.head_dim)
+                # attn_weights = attn_weights * decay_weights.mT[:, :, None, :]
+                attn_weights = attn_weights.clamp(max=5).exp()
+                # attn_weights = torch.nn.functional.silu(attn_weights.clamp(max=5))
+
+                # Decay in the attention weights
+                attn_weights = attn_weights * decay_gate_cum
+
+                causal_mask = (attention_mask==0)
+                attn_weights = attn_weights * causal_mask
+
+                # attn_weights = attn_weights / causal_mask.sum(-1, keepdim=True)
+
+                # Output gate
+                # attn_output = self.out_norm(attn_output)
+                return out_gate * torch.matmul(attn_weights, value_states.float()).to(dtype) / causal_mask.sum(-1, keepdim=True)
+
+            attn_output = checkpoint(
+                forwrd_gated, query_states, key_states, value_states, out_gate, in_gate, decay_gate, attention_mask
+            )
+
+            attn_output = self.out_norm(attn_output)
+
+
+        elif self.attention_type == "linear_elu":
+            # https://arxiv.org/abs/2006.16236
+
+            def forwrd_gated(query_states, key_states, value_states, attention_mask):
+                # Elu(X) + 1
+                query_states = elu(query_states) + 1
+                key_states = elu(key_states) + 1
+
+                # Inner product
+                attn_weights = query_states @ key_states.mT
+
+                # Mask
+                causal_mask = (attention_mask==0)
+                attn_weights = attn_weights * causal_mask
+
+                # Denominator
+                attn_weights = attn_weights / attn_weights.sum(-1, keepdim=True)
+
+                # Output
+                return attn_weights @ value_states
+
+            attn_output = checkpoint(
+                forwrd_gated, query_states, key_states, value_states, attention_mask
+            )
+
+
+
+
+        elif self.attention_type == "linear_relu":
+            # https://arxiv.org/abs/2410.10629
+
+            def forwrd_gated(query_states, key_states, value_states, attention_mask):
+                # Relu
+                query_states = relu(query_states)
+                key_states = relu(key_states)
+
+                # Inner product
+                attn_weights = query_states @ key_states.mT
+
+                # Mask
+                causal_mask = (attention_mask==0)
+                attn_weights = attn_weights * causal_mask
+
+                # Denominator
+                attn_weights = attn_weights / (attn_weights.sum(-1, keepdim=True) + 1e-8)
+
+                # Output
+                return attn_weights @ value_states
+
+            attn_output = checkpoint(
+                forwrd_gated, query_states, key_states, value_states, attention_mask
+            )
+
+
+        
+        elif self.attention_type == "linear_cosine":
+            def forwrd_gated(query_states, key_states, value_states, attention_mask):
+                # Normalize query and key
+                query_states = torch.nn.functional.normalize(query_states)
+                key_states = torch.nn.functional.normalize(key_states)
+
+                # Get binary mask
+                causal_mask = (attention_mask==0)
+
+                # Scale value
+                value_states = value_states / ((causal_mask).sum(-1, keepdims=True)**self.norm_const.sigmoid())
+
+                # Inner product
+                attn_weights = (query_states @ key_states.mT) * causal_mask
+
+                # Output gate
+                return attn_weights @ value_states
+            
+            attn_output = checkpoint(
+                forwrd_gated, query_states, key_states, value_states, attention_mask
+            )
+
+
+
         else:
             assert NotImplementedError
 
         # Remove heads, output projection
         #### NOTE: For some reason huggingface decided to put the transpose in
         ####       the function (I think due to flash attn). I put it back here
-        ####       but these means normal huggingface functions will have to be transposed :/
+        ####       but this means normal huggingface functions will have to be transposed :/
         attn_output = attn_output.transpose(1, 2).reshape(*input_shape, -1).contiguous()
         attn_output = self.o_proj(attn_output)
 

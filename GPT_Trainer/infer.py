@@ -11,12 +11,10 @@ import safetensors
 
 try:
     from GPT_Trainer.multi_gpu_helpers import is_main_process
-    from GPT_Trainer.LlamaCosAttention2 import LlamaCosAttention
-    from GPT_Trainer.LlamaDecoderLayer_Recur import LlamaDecoderLayer
+    from GPT_Trainer.LlamaDecoderLayer import LlamaDecoderLayer
 except ModuleNotFoundError:
     from multi_gpu_helpers import is_main_process
-    from LlamaCosAttention2 import LlamaCosAttention
-    from LlamaDecoderLayer_Recur import LlamaDecoderLayer
+    from LlamaDecoderLayer import LlamaDecoderLayer
 
 
 
@@ -25,89 +23,82 @@ except ModuleNotFoundError:
 @torch.no_grad()
 def infer():
     # Path to the model
-    # model_path = "models/SM AdamW"
-    # attention_type = "soft"
-    # model_path = "models/redo_lr1e-4_SM"
-    model_path = "models/CosOldLeftMulLeftNorm"
-    attention_type = "cos"
+    attention_type = "gated_softmax_plusplus"
+    model_path = "models/fineweb_gated_softmax_plusplus_35bs_2gpu_1024seqlen/"
     device = "cuda:0"
+    model_max_length = 1024
+
+
+    # Read token from .env file
+    with open(".env", "r") as f:
+        token = f.read().strip()
+
+    # Tokenizer
+    try:
+        tokenizer = transformers.AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf", use_fast=False, cache_dir="GPT_Trainer/llama2", token=token)
+        # self.tokenizer = transformers.AutoTokenizer.from_pretrained("EleutherAI/gpt-j-6B", use_fast=False, cache_dir="GPT_Trainer/gpt-j-6B")
+    except OSError:
+        raise FileNotFoundError("Token not found in .env file or user does not have access to Llama 2 weights with that token. Please add your Hugging Face token to the .env file.")
     
+    tokenizer.pad_token_id = tokenizer.eos_token_id
+    pad_token = torch.tensor([tokenizer.pad_token_id])
     
-    # Load the model
-    model = transformers.LlamaForCausalLM.from_pretrained(model_path.replace(" ", "_"))
-    model.to(device)
+    # Set max sequence length
+    tokenizer.model_max_length = model_max_length
+
+    # GPT-J Model. We are training it from scratch
+    model = transformers.LlamaForCausalLM(config=transformers.LlamaConfig.from_dict({
+        "_name_or_path": "meta-llama/Llama-2-7b-hf",
+        "architectures": [
+            "LlamaForCausalLM"
+        ],
+        "bos_token_id": 1,
+        "eos_token_id": 2,
+        "hidden_act": "silu",
+        "hidden_size": 1024, #4096,
+        "initializer_range": 0.02,
+        "intermediate_size": 1024*2, # 11008
+        "max_position_embeddings": model_max_length,
+        "model_type": "llama",
+        "num_attention_heads": 16,
+        "num_hidden_layers": 20,
+        "num_key_value_heads": 16,
+        "pretraining_tp": 1,
+        "rms_norm_eps": 1e-05,
+        "rope_scaling": None,
+        "tie_word_embeddings": False,
+        "torch_dtype": "float16",
+        "use_cache": True,
+        # "vocab_size": 32000,
+        "vocab_size": tokenizer.vocab_size,
+        "attention_type": attention_type,
+    }))
+
+    
+    # Replace all self attention layers with the cosine attention layer
+    for i, layer in enumerate(model.model.layers):
+        old = layer
+        model.model.layers[i] = LlamaDecoderLayer(model.config, layer_idx=i).to(layer.self_attn.q_proj.weight.device)
+        model.model.layers[i].self_attn.layer_num = i
+        del old
+
+    # Load in params
+    model.load_state_dict(safetensors.torch.load_file(model_path + "/model.safetensors"), strict=True)
     model.eval()
     
     
-    # Replace all self attention layers (BertSelfAttention) with the cosine attention layer (GPTCosAttention)
-    if attention_type == "cos":
-        for i, layer in enumerate(model.model.layers):
-            old = layer
-            
-            layer = LlamaDecoderLayer(model.config, layer_idx=i).to(layer.self_attn.q_proj.weight.device)
-            
-            # Copy weights
-            # layer.self_attn.q_proj.weight.data = old.self_attn.q_proj.weight.data
-            # if old.self_attn.q_proj.bias is not None:
-            #     layer.self_attn.q_proj.bias.data = old.self_attn.q_proj.bias.data
-            # else:
-            #     layer.self_attn.q_proj.bias = None
-            layer.self_attn.k_proj.weight.data = old.self_attn.k_proj.weight.data
-            if old.self_attn.k_proj.bias is not None:
-                layer.self_attn.k_proj.bias.data = old.self_attn.k_proj.bias.data
-            else:
-                layer.self_attn.k_proj.bias = None
-            layer.self_attn.v_proj.weight.data = old.self_attn.v_proj.weight.data
-            if old.self_attn.v_proj.bias is not None:
-                layer.self_attn.v_proj.bias.data = old.self_attn.v_proj.bias.data
-            else:
-                layer.self_attn.v_proj.bias = None
-            layer.self_attn.o_proj.weight.data = old.self_attn.o_proj.weight.data
-            if old.self_attn.o_proj.bias is not None:
-                layer.self_attn.o_proj.bias.data = old.self_attn.o_proj.bias.data
-            else:
-                layer.self_attn.o_proj.bias = None
-                
-            layer.mlp.gate_proj.weight.data = old.mlp.gate_proj.weight.data
-            if old.mlp.gate_proj.bias is not None:
-                layer.mlp.gate_proj.bias.data = old.mlp.gate_proj.bias.data
-            else:
-                layer.mlp.gate_proj.bias = None
-            layer.mlp.up_proj.weight.data = old.mlp.up_proj.weight.data
-            if old.mlp.up_proj.bias is not None:
-                layer.mlp.up_proj.bias.data = old.mlp.up_proj.bias.data
-            else:
-                layer.mlp.up_proj.bias = None
-            layer.mlp.down_proj.weight.data = old.mlp.down_proj.weight.data
-            if old.mlp.down_proj.bias is not None:
-                layer.mlp.down_proj.bias.data = old.mlp.down_proj.bias.data
-            else:
-                layer.mlp.down_proj.bias = None
-            layer.input_layernorm.weight.data = old.input_layernorm.weight.data
-            layer.post_attention_layernorm.weight.data = old.post_attention_layernorm.weight.data
-            
-            model.model.layers[i] = layer
-            
-            del old
-                
-            
-        # Load extra params if needed
-        model.load_state_dict(safetensors.torch.load_file(model_path.replace(" ", "_") + "/model-00001-of-00003.safetensors", device=device if device != "cpu" else None), strict=False)
-        model.load_state_dict(safetensors.torch.load_file(model_path.replace(" ", "_") + "/model-00002-of-00003.safetensors", device=device if device != "cpu" else None), strict=False)
-        model.load_state_dict(safetensors.torch.load_file(model_path.replace(" ", "_") + "/model-00003-of-00003.safetensors", device=device if device != "cpu" else None), strict=False)
-        
-        # Clear cache
-        torch.cuda.empty_cache()
-        
+    # Clear cache
+    torch.cuda.empty_cache()
+    
     # Number of parameters in billions
     num_params = sum(p.numel() for p in model.parameters() if p.requires_grad) / 1_000_000_000
     print(f"Number of parameters: {num_params:.2f}B")
         
     model = model.cuda()
     model.eval()
-        
+    
     # Load the tokenizer
-    tokenizer = torch.load(os.path.join(model_path, "tokenizer.pt"))  
+    # tokenizer = torch.load(os.path.join(model_path, "tokenizer.pt"))  
             
     # inference
     sentence = "Tell me about Ravens.\nRavens"
@@ -124,7 +115,7 @@ def infer():
     inputs = {k: v.cuda() for k, v in inputs.items()}
     
     
-    for i in range(len(inputs["input_ids"][0]), 512):
+    for i in range(len(inputs["input_ids"][0]), model_max_length):
         # Get the logits
         if attention_type == "cos":
             outputs = model(**inputs)

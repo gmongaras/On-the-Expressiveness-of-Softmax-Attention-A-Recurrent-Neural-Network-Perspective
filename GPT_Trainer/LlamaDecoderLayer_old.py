@@ -10,7 +10,7 @@ from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
 from transformers.models.llama.modeling_llama import repeat_kv
 from transformers.models.llama.modeling_llama import ACT2FN
 from transformers.models.llama.modeling_llama import LlamaRMSNorm
-from kernel.Gated_Attn_Test import GatedAttention
+from kernel.Gated_Attn import GatedAttention
 
 try:
     from GPT_Trainer.multi_gpu_helpers import is_main_process

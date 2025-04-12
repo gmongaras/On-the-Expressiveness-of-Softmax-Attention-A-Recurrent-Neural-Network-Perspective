@@ -12,6 +12,7 @@ import numpy as np
 from torch.utils.data import DataLoader
 import numpy as np
 from concurrent.futures import ThreadPoolExecutor
+import safetensors
 
 
 from torch.utils.data.distributed import DistributedSampler
@@ -48,6 +49,7 @@ def init_distributed():
                 backend="nccl",
                 init_method=dist_url,
                 world_size=world_size,
+                device_id=torch.device(f"cuda:{local_rank}"),
                 rank=rank)
     # Use the gloo backend if nccl isn't supported
     except RuntimeError:
@@ -55,6 +57,7 @@ def init_distributed():
                 backend="gloo",
                 init_method=dist_url,
                 world_size=world_size,
+                device_id=torch.device(f"cuda:{local_rank}"),
                 rank=rank)
 
     # this will make all .cuda() calls work properly
@@ -104,10 +107,13 @@ def get_scheduler(optimizer, warmup_steps, total_steps):
 
 class Trainer():
     def __init__(self, 
+            dataset,
+            model_size="small",
             batch_size=256,
             learning_rate=1e-4,
             warmup_steps=10_000,
-            num_steps=1_000_000, 
+            num_steps=1_000_000,
+            num_steps_early_stop=100_000, 
             dev="cpu",
             wandb_name=None,
             log_steps=10,
@@ -124,10 +130,14 @@ class Trainer():
             finetune=False,
             finetune_task=None,
             model_max_length=4096,
+            test_per=0.1,
+            num_steps_test=10_000,
         ):
+        self.dataset = dataset
         self.learning_rate = learning_rate
         self.warmup_steps = warmup_steps
         self.num_steps = num_steps
+        self.num_steps_early_stop = num_steps_early_stop
         self.wandb_name = wandb_name
         self.log_steps = log_steps
         self.use_amp = use_amp
@@ -139,6 +149,11 @@ class Trainer():
         self.keep_dataset_in_mem = keep_dataset_in_mem
         self.finetune_ = finetune
         self.finetune_task = finetune_task
+        self.test_per = test_per
+        self.num_steps_test = num_steps_test
+        self.model_max_length = model_max_length
+
+        self.padding_side = "right" if attention_type in ["linear_mamba", "linear_rwkv", "gated_softmax_plusplus"] else "left"
         
         
         
@@ -159,19 +174,15 @@ class Trainer():
         else:
             batch_size = batch_size
         self.batch_size = batch_size
+            
+        # Read token from .env file
+        with open(".env", "r") as f:
+            token = f.read().strip()
         
-        
-        
-        # Load in a checkpoint
+
         if load_checkpoint:
-            self.load_checkpoint(checkpoint_path)
-            
-        # Otherwise initialize from scratch
+            self.load_checkpoint(model_save_path)
         else:
-            # Read token from .env file
-            with open(".env", "r") as f:
-                token = f.read().strip()
-            
             # Tokenizer
             try:
                 self.tokenizer = transformers.AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-hf", use_fast=False, cache_dir="GPT_Trainer/llama2", token=token)
@@ -185,33 +196,61 @@ class Trainer():
             # Set max sequence length
             self.tokenizer.model_max_length = model_max_length
             
-            # GPT-J Model. We are training it from scratch
-            self.model = transformers.LlamaForCausalLM(config=transformers.LlamaConfig.from_dict({
-                "_name_or_path": "meta-llama/Llama-2-7b-hf",
-                "architectures": [
-                    "LlamaForCausalLM"
-                ],
-                "bos_token_id": 1,
-                "eos_token_id": 2,
-                "hidden_act": "silu",
-                "hidden_size": 1024, #4096,
-                "initializer_range": 0.02,
-                "intermediate_size": 1024*2, # 11008
-                "max_position_embeddings": model_max_length,
-                "model_type": "llama",
-                "num_attention_heads": 16,
-                "num_hidden_layers": 20,
-                "num_key_value_heads": 16,
-                "pretraining_tp": 1,
-                "rms_norm_eps": 1e-05,
-                "rope_scaling": None,
-                "tie_word_embeddings": False,
-                "torch_dtype": "float16",
-                "use_cache": True,
-                # "vocab_size": 32000,
-                "vocab_size": self.tokenizer.vocab_size,
-                "attention_type": attention_type,
-            }))
+            # Get model
+            if model_size == "small":
+                self.model = transformers.LlamaForCausalLM(config=transformers.LlamaConfig.from_dict({
+                    "_name_or_path": "meta-llama/Llama-2-7b-hf",
+                    "architectures": [
+                        "LlamaForCausalLM"
+                    ],
+                    "bos_token_id": 1,
+                    "eos_token_id": 2,
+                    "hidden_act": "silu",
+                    "hidden_size": 1024, #4096,
+                    "initializer_range": 0.02,
+                    "intermediate_size": 1024*2, # 11008
+                    "max_position_embeddings": model_max_length,
+                    "model_type": "llama",
+                    "num_attention_heads": 16,
+                    "num_hidden_layers": 20,
+                    "num_key_value_heads": 16,
+                    "pretraining_tp": 1,
+                    "rms_norm_eps": 1e-05,
+                    "rope_scaling": None,
+                    "tie_word_embeddings": False,
+                    "torch_dtype": "float16",
+                    "use_cache": True,
+                    "vocab_size": self.tokenizer.vocab_size,
+                    "attention_type": attention_type,
+                }))
+            elif model_size == "large":
+                self.model = transformers.LlamaForCausalLM(config=transformers.LlamaConfig.from_dict({
+                    "_name_or_path": "meta-llama/Llama-2-7b-hf",
+                    "architectures": [
+                        "LlamaForCausalLM"
+                    ],
+                    "bos_token_id": 1,
+                    "eos_token_id": 2,
+                    "hidden_act": "silu",
+                    "hidden_size": 1024*3,
+                    "initializer_range": 0.02,
+                    "intermediate_size": 1024*6,
+                    "max_position_embeddings": model_max_length,
+                    "model_type": "llama",
+                    "num_attention_heads": 16,
+                    "num_hidden_layers": 20,
+                    "num_key_value_heads": 16,
+                    "pretraining_tp": 1,
+                    "rms_norm_eps": 1e-05,
+                    "rope_scaling": None,
+                    "tie_word_embeddings": False,
+                    "torch_dtype": "float16",
+                    "use_cache": True,
+                    "vocab_size": self.tokenizer.vocab_size,
+                    "attention_type": attention_type,
+                }))
+            else:
+                raise RuntimeError(f"Model size must be small or large, but got {model_size}")
             
             
             # Replace all self attention layers with the cosine attention layer
@@ -220,6 +259,9 @@ class Trainer():
                 self.model.model.layers[i] = LlamaDecoderLayer(self.model.config, layer_idx=i).to(layer.self_attn.q_proj.weight.device)
                 self.model.model.layers[i].self_attn.layer_num = i
                 del old
+
+            num_params = sum(p.numel() for p in self.model.parameters() if p.requires_grad) / 1_000_000_000
+            print(f"Number of parameters: {num_params:.2f}B")
                     
                     
                     
@@ -250,10 +292,10 @@ class Trainer():
             
             # Optimizer
             self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate, betas=(0.9, 0.999), weight_decay=self.weight_decay, eps=1e-7)
-            
+
             # LR Scheduler
             self.scheduler = get_scheduler(self.optimizer, warmup_steps=warmup_steps, total_steps=self.num_steps)
-            
+
             # Step starts at 0
             self.step_ckpt = 0
             
@@ -265,40 +307,50 @@ class Trainer():
                 self.model_ref = self.model
             else:
                 self.model_ref = self.model.module
-        
+            
             
         
     def prepare_data(self, batch):
-        # Max length of the input (+1 for the extra pad token), but not more than the model's max length
-        max_length = min(max([len(x["input_ids"]) for x in batch]), self.tokenizer.model_max_length)
+        # Tokenize the batch
+        batch = self.tokenizer([i["text"] for i in batch], truncation=True, padding="longest", padding_side=self.padding_side, return_tensors="pt", max_length=self.tokenizer.model_max_length)
+
+        # # Max length of the input (+1 for the extra pad token), but not more than the model's max length
+        # max_length = min(max([len(x) for x in batch["input_ids"]]), self.tokenizer.model_max_length)
         
+        # Labels are the input ids shifted by 1
+        batch["labels"] = batch["input_ids"].clone()[:, 1:]
+        batch["input_ids"] = batch["input_ids"][:, :-1]
+        batch["attention_mask"] = batch["attention_mask"][:, :-1].bool()
         
-        for i in range(len(batch)):
-            ### Random window of the max length number of tokens ###
-            if len(batch[i]["input_ids"]) > max_length:
-                start = np.random.randint(0, len(batch[i]["input_ids"]) - max_length)
-                batch[i]["input_ids"] = batch[i]["input_ids"][start:start+max_length]
-                batch[i]["attention_mask"] = batch[i]["attention_mask"][start:start+max_length]
+        # for i in range(len(batch)):
+        #     ### Random window of the max 6length number of tokens ###
+        #     if len(batch["input_ids"][i]) > max_length:
+        #         start = np.random.randint(0, len(batch[i]["input_ids"]) - max_length)
+        #         batch[i]["input_ids"] = batch[i]["input_ids"][start:start+max_length]
+        #         batch[i]["attention_mask"] = batch[i]["attention_mask"][start:start+max_length]
             
-            ### Add a pad token to the end without mask to make the model stop itself
-            batch[i]["input_ids"] = torch.cat([batch[i]["input_ids"], self.pad_token])
-            batch[i]["attention_mask"] = torch.cat([batch[i]["attention_mask"], torch.tensor([0])])
+        #     ### Add a pad token to the end without mask to make the model stop itself
+        #     batch[i]["input_ids"] = torch.cat([batch[i]["input_ids"], self.pad_token])
+        #     batch[i]["attention_mask"] = torch.cat([batch[i]["attention_mask"], torch.tensor([0])])
         
-            ### Pad the input to max length
-            batch[i]["input_ids"] = torch.cat([batch[i]["input_ids"], self.pad_token.repeat(max_length+1 - len(batch[i]["input_ids"]))])
-            batch[i]["attention_mask"] = torch.cat([batch[i]["attention_mask"], torch.zeros(max_length+1 - len(batch[i]["attention_mask"]), dtype=torch.long)]).bool()
+        #     ### Pad the input to max length
+        #     batch[i]["input_ids"] = torch.cat([batch[i]["input_ids"], self.pad_token.repeat(max_length+1 - len(batch[i]["input_ids"]))])
+        #     batch[i]["attention_mask"] = torch.cat([batch[i]["attention_mask"], torch.zeros(max_length+1 - len(batch[i]["attention_mask"]), dtype=torch.long)]).bool()
             
-            ### Labels are input ids shifted by one. Remove the last token from the others to match the labels
-            batch[i]["labels"] = batch[i]["input_ids"].clone()[1:]
-            batch[i]["input_ids"] = batch[i]["input_ids"][:-1]
-            batch[i]["attention_mask"] = batch[i]["attention_mask"][:-1]
+        #     ### Labels are input ids shifted by one. Remove the last token from the others to match the labels
+        #     batch[i]["labels"] = batch[i]["input_ids"].clone()[1:]
+        #     batch[i]["input_ids"] = batch[i]["input_ids"][:-1]
+        #     batch[i]["attention_mask"] = batch[i]["attention_mask"][:-1]
+
+        # When all the sequence lengths are the same, the mask will be all True.
+        # Annoyingly, this causes a bug with the attention mask. To get around this
+        # issue without changing the transformers code, I am adding a single "False"
+        # to one of the positions.
+        if torch.all(batch["attention_mask"] == True):
+            batch["attention_mask"][0, -1] = False
                     
         # Stack the data
-        return {
-            "input_ids": torch.stack([x["input_ids"] for x in batch]),
-            "attention_mask": torch.stack([x["attention_mask"] for x in batch]),
-            "labels": torch.stack([x["labels"] for x in batch]),
-        }
+        return batch
         
         
         
@@ -314,7 +366,7 @@ class Trainer():
             
     def train_model(self):
         # self.train_model_("Traxap/Pile_Tokenized", self.num_steps, self.step_ckpt)
-        self.train_model_("TrevorDohm/Pile_TokLlama", self.num_steps, self.step_ckpt)
+        self.train_model_(self.num_steps, self.step_ckpt)
         
         # self.train_model_("gmongaras/Pile_Llama_Tokenized", self.num_steps, self.step_ckpt)
         # self.train_model_("gmongaras/BERT_Base_Cased_512_Dataset_Mapped", self.num_steps, self.step_ckpt)
@@ -324,39 +376,73 @@ class Trainer():
         
         
         
-    def train_model_(self, dataset, num_steps, step_shift):
+    def train_model_(self, num_steps, step_shift):
         # Cache dirs
-        cache_path = "/users/gmongaras/work/datasets/data_cache/"
+        # cache_path = "/users/gmongaras/work/datasets/data_cache/"
+        cache_path = "cache"
+        os.environ["HF_HOME"] = cache_path
+        os.environ["HF_HUB_CACHE"] = cache_path
         # cache_path = "BERT_Trainer/data_cache/dataset_mapped"
         # cache_path = "GPT_Trainer/data_cache/dataset_mapped"
         
         # Load in datasets
         if not os.path.exists(cache_path):
             os.makedirs(cache_path)
-        self.tokenized_dataset = datasets.load_dataset(dataset, cache_dir=cache_path, num_proc=16, keep_in_memory=self.keep_dataset_in_mem, split="train")
+        if self.dataset == "HuggingFaceFW/fineweb":
+            name = "CC-MAIN-2024-51"
+        else:
+            name = None
+        self.dataset_ = datasets.load_dataset(self.dataset,
+                name=name,
+                cache_dir=cache_path,
+                num_proc=16,
+                split="train",
+                download_config=datasets.DownloadConfig(
+                    max_retries=20,
+                    cache_dir=cache_path,
+                ))
         
         # Load dummy data
         # tokenized_dataset = datasets.load_from_disk("BERT_Trainer/data_cache/dummy_dataset")
         
         
-        if dataset == "gmongaras/dummy_text_dataset":
+        if self.dataset == "gmongaras/dummy_text_dataset":
             def tokenize_function(examples):
                 return self.tokenizer(examples["text"], truncation=False)
-            self.tokenized_dataset = self.tokenized_dataset.map(
+            self.dataset_ = self.dataset_.map(
                 tokenize_function,
                 remove_columns=["text"],
                 cache_file_name="dummy_tokenized_dataset",
             )
+
+        # Test/train split
+        if self.dataset in [
+                "gmongaras/SlimPajama-627B_Reupload",
+            ]:
+            self.dataset_test = datasets.load_dataset(self.dataset,
+                name=name,
+                cache_dir=cache_path,
+                num_proc=16,
+                split="test",
+                download_config=datasets.DownloadConfig(
+                    max_retries=20,
+                    cache_dir=cache_path,
+                ))
+        else:
+            data_split = self.dataset_.train_test_split(test_size=self.test_per, seed=123)
+            self.dataset_ = data_split["train"]
+            self.dataset_test = data_split["test"]
         
         # Convert data to torch
-        self.tokenized_dataset.set_format(type="torch", columns=["input_ids", "attention_mask"])
+        self.dataset_.set_format(type="torch", columns=["text"])
+        self.dataset_test.set_format(type="torch", columns=["text"])
         
         # PyTorch random sampler
-        random_sampler = torch.utils.data.RandomSampler(self.tokenized_dataset, replacement=True, num_samples=(num_steps-step_shift)*self.batch_size)
+        random_sampler = torch.utils.data.RandomSampler(self.dataset_, replacement=True, num_samples=(num_steps-step_shift)*self.batch_size)
         
         # PyTorch data loader
         data_loader = torch.utils.data.DataLoader(
-            self.tokenized_dataset, 
+            self.dataset_, 
             sampler=random_sampler,
             batch_size=self.batch_size, 
             collate_fn=lambda x: x,
@@ -381,7 +467,7 @@ class Trainer():
                 resume="must" if self.wandb_id is not None else None,
                 id=self.wandb_id,
             )
-            wandb.watch(self.model, log_freq=self.log_steps)
+            # wandb.watch(self.model, log_freq=self.log_steps)
             
             # Save wandb run id
             self.wandb_id = wandb.run.id
@@ -499,6 +585,83 @@ class Trainer():
                 
             # Clear cache
             # torch.cuda.empty_cache()
+
+            if step == self.num_steps_early_stop:
+                break
+
+
+
+
+
+            # Testing the model
+            if step % self.num_steps_test == 0 and step > 10:
+                with torch.no_grad():
+                    # Put model in eval mode
+                    self.model.eval()
+
+                    # Create sampler and datalaoder
+                    test_data_loader = torch.utils.data.DataLoader(
+                        self.dataset_test,
+                        shuffle=True,
+                        batch_size=self.batch_size, 
+                        collate_fn=lambda x: x,
+                        
+                        num_workers=10,
+                        prefetch_factor=10,
+                        persistent_workers=True,
+                    )
+
+                    # Average loss and ppl
+                    avg_test_loss = 0
+                    avg_test_ppl = 0
+                    total_batches = 0
+
+                    # Testing loop
+                    for num, batch in enumerate(tqdm(test_data_loader)):
+                        # Augment input
+                        batch = self.prepare_data(batch)
+                            
+                        # Get input and labels
+                        input_ids = batch["input_ids"].to(self.model.device)
+                        attention_mask = batch["attention_mask"].to(self.model.device)
+                        labels = batch["labels"].to(self.model.device)
+                    
+                        with torch.autocast(device_type='cuda', dtype=torch.bfloat16) if self.use_amp else nullcontext():
+                            outputs = self.model(input_ids, attention_mask=attention_mask).logits
+                            
+                            # Mask labels with -100 where the attention mask is 0. Note that the mask needs to be shifted by one to match the labels
+                            labels = torch.where(attention_mask, labels, torch.tensor(-100).to(labels.device))
+                            
+                            # Loss
+                            loss = loss_fct(outputs.view(-1, self.model_ref.config.vocab_size), labels.view(-1).to(outputs.device))
+
+                        # Perplexity
+                        ppl = loss.exp().item()
+                        loss = loss.item()
+
+                        # Accumulate loss and ppl
+                        avg_test_loss += loss
+                        avg_test_ppl += ppl
+                        total_batches += 1
+
+                    # Get the averages
+                    avg_test_loss /= total_batches
+                    avg_test_ppl /= total_batches
+
+                    # Log to wandb 
+                    if is_main_process():
+                        wandb.log({
+                            "test_loss": avg_test_loss,
+                            "test_perplexity": avg_test_ppl,
+                        },
+                        step=step)
+
+                    del test_data_loader
+
+                    # Put model in train mode
+                    self.model.train()
+
+                
             
                 
                 
@@ -538,90 +701,41 @@ class Trainer():
             
     def load_checkpoint(self, checkpoint_path):
         # Load the model
-        if self.finetune_:
-            self.model = transformers.LlamaForCausalLM.from_pretrained(checkpoint_path.replace(" ", "_"))
-        else:
-            self.model = transformers.LlamaForCausalLM.from_pretrained(checkpoint_path.replace(" ", "_"))
+        self.model = transformers.LlamaForCausalLM.from_pretrained(checkpoint_path.replace(" ", "_"))
         
         # Load the config
         config = torch.load(os.path.join(checkpoint_path, "config.pt"))
-        if not self.finetune_: # Don't load some config variables if finetuning
-            self.learning_rate = config["learning_rate"]
-            self.warmup_steps = config["warmup_steps"]
-            self.num_steps = config["num_steps"]
-            if not self.finetune_:
-                self.wandb_name = config["wandb_name"]
-            self.log_steps = config["log_steps"]
-            self.use_amp = config["use_amp"]
-            self.dev = config["dev"]
-            self.clipping_value = config["clipping_value"]
-            self.weight_decay = config["weight_decay"]
-            self.step_ckpt = config["step_ckpt"]
-            self.wandb_id = config["wandb_id"]
-            self.num_samples = config.get("num_samples", 0)
+        self.learning_rate = config["learning_rate"]
+        self.warmup_steps = config["warmup_steps"]
+        self.num_steps = config["num_steps"]
+        self.wandb_name = config["wandb_name"]
+        self.log_steps = config["log_steps"]
+        self.use_amp = config["use_amp"]
+        self.dev = config["dev"]
+        self.clipping_value = config["clipping_value"]
+        self.weight_decay = config["weight_decay"]
+        self.step_ckpt = config["step_ckpt"]
+        self.wandb_id = config["wandb_id"]
+        self.num_samples = config.get("num_samples", 0)
         self.attention_type = config["attention_type"]
         self.mlp_type = config["mlp_type"]
         
-        # Replace all decoder layers
+        # Replace all self attention layers with the cosine attention layer
         for i, layer in enumerate(self.model.model.layers):
             old = layer
-            
-            layer = LlamaDecoderLayer(self.model.config).to(layer.self_attn.q_proj.weight.device)
-            layer.self_attn.layer_num = i
-            
-            # Copy weights
-            layer.self_attn.q_proj.weight.data = old.self_attn.q_proj.weight.data
-            if old.self_attn.q_proj.bias is not None:
-                layer.self_attn.q_proj.bias.data = old.self_attn.q_proj.bias.data
-            else:
-                layer.self_attn.q_proj.bias = None
-            layer.self_attn.k_proj.weight.data = old.self_attn.k_proj.weight.data
-            if old.self_attn.k_proj.bias is not None:
-                layer.self_attn.k_proj.bias.data = old.self_attn.k_proj.bias.data
-            else:
-                layer.self_attn.k_proj.bias = None
-            layer.self_attn.v_proj.weight.data = old.self_attn.v_proj.weight.data
-            if old.self_attn.v_proj.bias is not None:
-                layer.self_attn.v_proj.bias.data = old.self_attn.v_proj.bias.data
-            else:
-                layer.self_attn.v_proj.bias = None
-            layer.self_attn.o_proj.weight.data = old.self_attn.o_proj.weight.data
-            if old.self_attn.o_proj.bias is not None:
-                layer.self_attn.o_proj.bias.data = old.self_attn.o_proj.bias.data
-            else:
-                layer.self_attn.o_proj.bias = None
-                
-            layer.mlp.gate_proj.weight.data = old.mlp.gate_proj.weight.data
-            if old.mlp.gate_proj.bias is not None:
-                layer.mlp.gate_proj.bias.data = old.mlp.gate_proj.bias.data
-            else:
-                layer.mlp.gate_proj.bias = None
-            layer.mlp.up_proj.weight.data = old.mlp.up_proj.weight.data
-            if old.mlp.up_proj.bias is not None:
-                layer.mlp.up_proj.bias.data = old.mlp.up_proj.bias.data
-            else:
-                layer.mlp.up_proj.bias = None
-            layer.mlp.down_proj.weight.data = old.mlp.down_proj.weight.data
-            if old.mlp.down_proj.bias is not None:
-                layer.mlp.down_proj.bias.data = old.mlp.down_proj.bias.data
-            else:
-                layer.mlp.down_proj.bias = None
-            layer.input_layernorm.weight.data = old.input_layernorm.weight.data
-            layer.post_attention_layernorm.weight.data = old.post_attention_layernorm.weight.data
-            
-            self.model.model.layers[i] = layer
-            
+            self.model.model.layers[i] = LlamaDecoderLayer(self.model.config, layer_idx=i).to(layer.self_attn.q_proj.weight.device)
+            self.model.model.layers[i].self_attn.layer_num = i
             del old
-                
-            # Load extra params if needed
-            self.model.load_state_dict(torch.load(checkpoint_path.replace(" ", "_") + "/pytorch_model-00001-of-00002.bin", map_location=self.model.model.layers[0].self_attn.q_proj.weight.device), strict=False)
-            self.model.load_state_dict(torch.load(checkpoint_path.replace(" ", "_") + "/pytorch_model-00002-of-00002.bin", map_location=self.model.model.layers[0].self_attn.q_proj.weight.device), strict=False)
-            
-            # Clear cache
-            torch.cuda.empty_cache()
+
+        # Load in params
+        self.model.load_state_dict(safetensors.torch.load_file(self.model_save_path + "/model.safetensors"), strict=True)
         
         # Load the tokenizer
-        self.tokenizer = torch.load(os.path.join(checkpoint_path, "tokenizer.pt"))             
+        self.tokenizer = torch.load(os.path.join(checkpoint_path, "tokenizer.pt"), weights_only=False)            
+        self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        self.pad_token = torch.tensor([self.tokenizer.pad_token_id])
+        # Set max sequence length
+        self.tokenizer.model_max_length = self.model_max_length 
             
             
         # Put the model on the desired device
@@ -650,23 +764,13 @@ class Trainer():
             
             
             
-        # New optimizer if finetuning
-        if self.finetune_:
-            # Initialize optimizer
-            self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate, betas=(0.9, 0.999), weight_decay=self.weight_decay, eps=1e-7)
-            
-        # Load checkpoint for optimizer if not finetuning
-        else:
-            # Load the optimizer
-            self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate, betas=(0.9, 0.999), weight_decay=self.weight_decay, eps=1e-7)
-            self.optimizer.load_state_dict(torch.load(os.path.join(checkpoint_path, "optimizer.pt"), map_location=self.model.device))
-            
-            # Load the scheduler
-            self.scheduler = get_scheduler(self.optimizer, warmup_steps=self.warmup_steps, total_steps=self.num_steps)
-            self.scheduler.load_state_dict(torch.load(os.path.join(checkpoint_path, "scheduler.pt"), map_location=self.model.device))
-            
-        self.pad_token = torch.tensor([self.tokenizer.pad_token_id])
-
+        # Load the optimizer
+        self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=self.learning_rate, betas=(0.9, 0.999), weight_decay=self.weight_decay, eps=1e-7)
+        self.optimizer.load_state_dict(torch.load(os.path.join(checkpoint_path, "optimizer.pt"), map_location=self.model.device))
+        
+        # Load the scheduler
+        self.scheduler = get_scheduler(self.optimizer, warmup_steps=self.warmup_steps, total_steps=self.num_steps)
+        self.scheduler.load_state_dict(torch.load(os.path.join(checkpoint_path, "scheduler.pt"), map_location=self.model.device))
 
 
 # GPT in my dreams UwU
