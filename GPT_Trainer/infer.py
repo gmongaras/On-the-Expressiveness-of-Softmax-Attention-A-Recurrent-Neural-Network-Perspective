@@ -23,8 +23,8 @@ except ModuleNotFoundError:
 @torch.no_grad()
 def infer():
     # Path to the model
-    attention_type = "gated_softmax_plusplus"
-    model_path = "models/fineweb_gated_softmax_plusplus_35bs_2gpu_1024seqlen/"
+    attention_type = "gated_softmax_plusplus_extratoks"
+    model_path = "models/fineweb_gated_softmax_plusplus_extratoks_35bs_2gpu_1024seqlenV2/"
     device = "cuda:0"
     model_max_length = 1024
 

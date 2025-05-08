@@ -132,6 +132,7 @@ class Trainer():
             model_max_length=4096,
             test_per=0.1,
             num_steps_test=10_000,
+            test_loss=True,
         ):
         self.dataset = dataset
         self.learning_rate = learning_rate
@@ -152,9 +153,10 @@ class Trainer():
         self.test_per = test_per
         self.num_steps_test = num_steps_test
         self.model_max_length = model_max_length
+        self.test_loss = test_loss
 
-        self.padding_side = "right" if attention_type in ["linear_mamba", "linear_rwkv", "gated_softmax_plusplus"] else "left"
-        
+        # self.padding_side = "right" if attention_type in ["linear_mamba", "linear_rwkv", "gated_softmax_plusplus_mamba", "gated_softmax_plusplus_mamba2"] else "left"
+        self.padding_side = "right"
         
         
         # Must load a checkpoint if finetuning
@@ -348,6 +350,13 @@ class Trainer():
         # to one of the positions.
         if torch.all(batch["attention_mask"] == True):
             batch["attention_mask"][0, -1] = False
+
+        # Replace first three tokens with padding tokens and mask as False
+        if self.attention_type == "gated_softmax_plusplus_extratoks":
+            new_ = torch.zeros(batch["input_ids"].shape[0], 3).int()
+            batch["input_ids"] = torch.cat([new_, batch["input_ids"][:, :-3]], dim=-1)
+            batch["labels"] = torch.cat([new_, batch["labels"][:, :-3]], dim=-1)
+            batch["attention_mask"] = torch.cat([new_.bool(), batch["attention_mask"][:, :-3]], dim=-1)
                     
         # Stack the data
         return batch
@@ -416,7 +425,9 @@ class Trainer():
             )
 
         # Test/train split
-        if self.dataset in [
+        if self.dataset == "gmongaras/dummy_text_dataset":
+            self.dataset_test = self.dataset
+        elif self.dataset in [
                 "gmongaras/SlimPajama-627B_Reupload",
             ]:
             self.dataset_test = datasets.load_dataset(self.dataset,
@@ -459,6 +470,7 @@ class Trainer():
         # Initialize wandb run
         if is_main_process():
             wandb.init(
+                # project="Gated_Attention",
                 project="Gated_Attention",
                 name=self.wandb_name,
                 notes=None, # May add notes later
@@ -488,6 +500,7 @@ class Trainer():
                 
             # Augment input
             batch = self.prepare_data(batch)
+            # torch.autograd.set_detect_anomaly(True)
                 
             # Get input and labels
             input_ids = batch["input_ids"].to(self.model.device)
@@ -594,7 +607,7 @@ class Trainer():
 
 
             # Testing the model
-            if step % self.num_steps_test == 0 and step > 10:
+            if step % self.num_steps_test == 0 and step > 10 and self.test_loss:
                 with torch.no_grad():
                     # Put model in eval mode
                     self.model.eval()
