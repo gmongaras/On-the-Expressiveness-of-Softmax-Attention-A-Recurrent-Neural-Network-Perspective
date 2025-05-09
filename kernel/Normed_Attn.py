@@ -754,9 +754,14 @@ def _attn_fwd_inner_norm2(acc, q,  #
             qk = qk * qk_scale + tl.where(mask, 0, -1.0e6)
         else:
             qk = qk * qk_scale
+        
+        # if clamp_e:
+        #     p = tl.clamp(p, min=-torch.inf, max=5*1.44269504)  # 1/log(2))
+        
         p = tl.math.exp2(qk)
-        if clamp_e:
-            p = tl.clamp(p, min=-torch.inf, max=5)
+        if clamp_e: # Clamp to e^5
+            p = tl.clamp(p, min=-torch.inf, max=148.413159103)
+
         # update acc
         v = tl.load(V_block_ptr)
         if fp8_v:
@@ -1291,8 +1296,8 @@ class _attention_normed(torch.autograd.Function):
         
         # # # # # Manual
         # causal_mask = torch.tril(torch.ones(1, 1, q.shape[-2], k.shape[-2])).bool().to(device)
-        # o_ = ((((q.float() @ k.float().mT) * sm_scale).masked_fill(~causal_mask, -torch.inf).exp().clamp(max=5)) @ v.float()) / causal_mask.sum(-1, keepdim=True)
-        # # o_ = (((q @ k.mT) * sm_scale).masked_fill(~causal_mask, -torch.inf).exp().clamp(max=5)) @ v
+        # o_ = ((((q.float() @ k.float().mT) * sm_scale).masked_fill(~causal_mask, -torch.inf).clamp(max=5).exp()) @ v.float()) / causal_mask.sum(-1, keepdim=True)
+        # # o_ = (((q @ k.mT) * sm_scale).masked_fill(~causal_mask, -torch.inf).clamp(max=5).exp()) @ v
         # N_ = (o_**2).sum(-1)**0.5
         # o_ = torch.nn.functional.normalize(o_, dim=-1)
 
@@ -1302,7 +1307,7 @@ class _attention_normed(torch.autograd.Function):
         grid = lambda args: (triton.cdiv(q.shape[2], args["BLOCK_M"]), q.shape[0] * q.shape[1], 1)
         ctx.grid = grid
         _attn_fwd_norm2[grid](
-            q, k, v, sm_scale, N, o,  #
+            q.half(), k.half(), v.half(), sm_scale, N, o,  #
             q.stride(0), q.stride(1), q.stride(2), q.stride(3),  #
             k.stride(0), k.stride(1), k.stride(2), k.stride(3),  #
             v.stride(0), v.stride(1), v.stride(2), v.stride(3),  #
@@ -1335,13 +1340,25 @@ class _attention_normed(torch.autograd.Function):
         ctx.HEAD_DIM = HEAD_DIM_K
         ctx.causal = causal
         ctx.divS = divS
+        ctx.clamp_e = clamp_e
         return o
 
     @staticmethod
     def backward(ctx, do):
         q, k, v, o, n = ctx.saved_tensors
+
+        if ctx.clamp_e:
+            e_clamp_val = 5
+        else:
+            e_clamp_val = torch.inf
+
         causal_mask = torch.tril(torch.ones(1, 1, q.shape[-2], k.shape[-2])).bool().to(device)
-        matrix = ((q @ k.mT) * ctx.sm_scale).exp() * causal_mask
+        matrix = (q @ k.mT) * ctx.sm_scale
+        matrix_no_clamp_der = matrix.clamp(max=e_clamp_val).exp() * causal_mask
+        def clamp_exp_der(X, max_val):
+            return X.clamp(max=max_val).exp() * (X <= max_val)
+        matrix = clamp_exp_der(matrix, e_clamp_val)
+        matrix = matrix * causal_mask
 
         # o_ = (matrix @ v).float()
         # o_square = (matrix @ v).float()**2
@@ -1350,21 +1367,22 @@ class _attention_normed(torch.autograd.Function):
         #     (o_square.sum(-1, keepdim=True) - o_square)*do
         #     - (o_ * (o_do.sum(-1, keepdim=True) - o_do))
         # ) * (((o_square.sum(-1, keepdim=True))**-1.5))
+
+        do = ((do - (o * (do * o).sum(dim=-1, keepdim=True))) / n[..., None])
         if ctx.divS:
             do = do / torch.arange(1, 1+q.shape[-2]).to(q.dtype).to(q.device)[None, None, :, None]
-        do = ((do - (o * (do * o).sum(dim=-1, keepdim=True))) / n[..., None])
 
         # do = (
         #     ((o_square*do).sum(-1, keepdim=True) - (o_square*do))
         #     - (o_ * (o_.sum(-1, keepdim=True) - o_))
         # ) * (((o_square.sum(-1, keepdim=True))**-1.5) + 1e-6)
         do = do.to(q.dtype)
-        dv = matrix.mT @ do
+        dv = matrix_no_clamp_der.mT @ do
         inter = (matrix * (do @ v.mT) * ctx.sm_scale)
         dq = inter @ k
         dk = inter.mT @ q
 
-        # return dq, dk, dv, None, None
+        return dq, dk, dv, None, None
         
 
 
@@ -1528,25 +1546,28 @@ print()
 
 
 
-N = 10
+N = 2
 H = 4
 S = 128
 d = 64
-Q = torch.randn(N, H, S, d).cuda().half().requires_grad_()
-K = torch.randn_like(Q).requires_grad_()
-V = torch.randn_like(Q).requires_grad_()
+Q = (torch.randn(N, H, S, d).cuda().half()).requires_grad_()
+K = (torch.randn_like(Q)).requires_grad_()
+V = (torch.randn_like(Q)).requires_grad_()
 
 Q_ = Q.clone().detach().requires_grad_(True)
 K_ = K.clone().detach().requires_grad_(True)
 V_ = V.clone().detach().requires_grad_(True)
 causal_mask = torch.tril(torch.ones(1, 1, Q_.shape[-2], K_.shape[-2])).bool().to(device)
-o_ = torch.nn.functional.normalize((((Q_ @ K_.mT) * (d**-0.5)).exp() * causal_mask) @ V_, p=2, dim=-1)
-# o_ = torch.nn.functional.normalize(((((Q_ @ K_.mT) * (d**-0.5)).exp() * causal_mask) /causal_mask.sum(-1, keepdim=True)) @ V_, p=2, dim=-1)
-W = torch.randn(d, 1).cuda().half()
+# o_ = torch.nn.functional.normalize((((Q_.float() @ K_.float().mT) * (d**-0.5)).exp() * causal_mask) @ V_.float(), p=2, dim=-1)
+o_ = torch.nn.functional.normalize(((((Q_.float() @ K_.float().mT) * (d**-0.5)).exp() * causal_mask) / causal_mask.sum(-1, keepdim=True)) @ V_.float(), p=2, dim=-1)
+# o_ = ((((Q_.float() @ K_.float().mT) * (d**-0.5)).clamp(max=5).exp() * causal_mask) / causal_mask.sum(-1, keepdim=True)) @ V_.float()
+W = torch.randn(d, 1).cuda().float()
 (o_@W).sum().backward()
 
-o = attention(Q, K, V, True, (d**-0.5))
+o = attention(Q, K, V, True, (d**-0.5)).float()
 (o@W).sum().backward()
+
+# check = torch.autograd.gradcheck(attention, (Q.double(), K.double(), V.double(), True, (d**-0.5)), eps=1e-4)
 
 print()
 
