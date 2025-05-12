@@ -47,10 +47,11 @@ export LOGLEVEL=INFO
 
 source ~/.bashrc
 cd /projects/eclarson/protein_diffusion/gmongaras_diffusion_models/Gated_Attention
-CUDA_VISIBLE_DEVICES=0,1 srun /home/gmongaras/miniconda3/bin/torchrun \
+# CUDA_VISIBLE_DEVICES=0,1 
+srun /home/gmongaras/miniconda3/bin/torchrun \
 --nnodes $nnodes \
 --nproc_per_node $nproc_per_node \
 --rdzv_id $RANDOM \
 --rdzv_backend c10d \
---rdzv_endpoint $head_node_ip:29525 \
+--rdzv_endpoint $head_node_ip:29683 \
 GPT_Trainer/train.py

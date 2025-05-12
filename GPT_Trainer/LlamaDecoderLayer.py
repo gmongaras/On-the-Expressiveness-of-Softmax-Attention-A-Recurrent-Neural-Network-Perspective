@@ -273,7 +273,10 @@ class LlamaAttention(nn.Module):
             "softmax_clamp_denom", # Normal softmax, clamp denominator to be at least one
             "softmax_detach_denom", # Normal softmax, detach denominator
             "softmax_detach_denom_gate", # Normal softmax, detach denominator, add a gate
+            "softmax_divs", # Normal softmax, no denom divde by S
+            "softmax_gate", # Normal softmax, no denom, add an output gate
             "softmax_divS_gate", # Normal softmax, no denom divde by S, add a gate
+            "softmax_divS_gatev2", # Normal softmax, no denom divde by S, add a gate
             "softmax_divS_norm", # Normal softmax, no denom divde by S, add a gate
 
             "softmax_taylor_80terms", # 80 term taylor series exp approximation
@@ -284,8 +287,13 @@ class LlamaAttention(nn.Module):
             "gated_softmax_no_out_gate", # Gated softmax, no output gate
             "gated_softmax_no_out_gate_no_norm", # Gated softmax, no output gate, no norm
             "gated_softmax_no_in_gate_no_norm", # Gated softmax, no input gate, no norm
+            "gated_relu_no_in_gate_no_norm",
             "gated_softmax_no_gate", # Gated softmax, no input or output gate
             "gated_softmax_no_gate_L2norm_nodivS", # Gated softmax, no input or output gate, change layer norm to no param L2 norm
+            "gated_softmax_no_gate_L2norm_nodivS_noclamp", # Gated softmax, no input or output gate, change layer norm to no param L2 norm
+            "gated_ReLU_no_gate_L2norm_nodivS_noclamp",
+            "gated_softmax_out_gate_L2norm_nodivS_noclamp", # Gated softmax, no input gate, with output gate, change layer norm to no param L2 norm
+            "gated_softmax_post_out_gate_L2norm_nodivS_noclamp",
             "gated_softmax_no_gate_rmsnorm", # Gated softmax, no input or output gate, change layer norm to rms norm
             "gated_softmax_no_gate_rmsnorm_nodivS", # Gated softmax, no div by S, no input or output gate, change layer norm to rms norm
             "gated_softmax_no_gate_no_norm", # Gated softmax, no input or output gate, no norm
@@ -335,8 +343,8 @@ class LlamaAttention(nn.Module):
 
             # For softmax_detach_denom_gate, only a gate on the queries
             # as that acts like the denominator
-            if self.attention_type in ["softmax_detach_denom_gate", "softmax_divS_gate", "softmax_divS_norm"]:
-                if self.attention_type in ["softmax_detach_denom_gate", "softmax_divS_gate"]:
+            if self.attention_type in ["softmax_detach_denom_gate", "softmax_gate", "softmax_divS_gate", "softmax_divS_gatev2", "softmax_divS_norm"]:
+                if self.attention_type in ["softmax_detach_denom_gate", "softmax_gate", "softmax_divS_gate", "softmax_divS_gatev2"]:
                     self.out_gate_proj = nn.Linear(config.hidden_size, config.num_attention_heads, bias=True)
                 elif self.attention_type in ["softmax_divS_norm"]:
                     self.out_norm = nn.RMSNorm(self.head_dim)
@@ -349,9 +357,14 @@ class LlamaAttention(nn.Module):
                     "gated_softmax_no_out_gate",
                     "gated_softmax_no_out_gate_no_norm",
                     "gated_softmax_no_in_gate_no_norm", 
+                    "gated_relu_no_in_gate_no_norm",
                     "gated_softmax_no_gate",
                     "gated_softmax_no_gate_rmsnorm",
                     "gated_softmax_no_gate_L2norm_nodivS",
+                    "gated_softmax_no_gate_L2norm_nodivS_noclamp",
+                    "gated_ReLU_no_gate_L2norm_nodivS_noclamp",
+                    "gated_softmax_out_gate_L2norm_nodivS_noclamp",
+                    "gated_softmax_post_out_gate_L2norm_nodivS_noclamp",
                     "gated_softmax_no_gate_rmsnorm_nodivS",
                     "gated_softmax_no_gate_no_norm",
                     "gated_softmax_no_gate_customnorm",
@@ -360,13 +373,13 @@ class LlamaAttention(nn.Module):
                     "gated_softmax_decay",
                     "gated_softmax_cumgate",
                 ]:
-                if self.attention_type not in ["gated_softmax_no_out_gate", "gated_softmax_no_out_gate_no_norm", "gated_softmax_no_gate", "gated_softmax_no_gate_no_norm", "gated_softmax_no_gate_rmsnorm", "gated_softmax_no_gate_L2norm_nodivS", "gated_softmax_no_gate_rmsnorm_nodivS", "gated_softmax_no_gate_customnorm"]:
+                if self.attention_type not in ["gated_softmax_no_out_gate", "gated_softmax_no_out_gate_no_norm", "gated_softmax_no_gate", "gated_softmax_no_gate_no_norm", "gated_softmax_no_gate_rmsnorm", "gated_softmax_no_gate_L2norm_nodivS", "gated_softmax_no_gate_L2norm_nodivS_noclamp", "gated_ReLU_no_gate_L2norm_nodivS_noclamp", "gated_softmax_no_gate_rmsnorm_nodivS", "gated_softmax_no_gate_customnorm"]:
                     self.out_gate_proj = nn.Linear(config.hidden_size, config.num_attention_heads, bias=True)
-                if self.attention_type not in ["gated_softmax_no_in_gate", "gated_softmax_no_in_gate_no_norm", "gated_softmax_no_gate", "gated_softmax_no_gate_no_norm", "gated_softmax_no_gate_rmsnorm", "gated_softmax_no_gate_L2norm_nodivS", "gated_softmax_no_gate_rmsnorm_nodivS", "gated_softmax_no_gate_customnorm", "gated_softmax_cumgate"]:
+                if self.attention_type not in ["gated_softmax_no_in_gate", "gated_softmax_no_in_gate_no_norm", "gated_relu_no_in_gate_no_norm", "gated_softmax_no_gate", "gated_softmax_no_gate_no_norm", "gated_softmax_no_gate_rmsnorm", "gated_softmax_no_gate_L2norm_nodivS", "gated_softmax_no_gate_L2norm_nodivS_noclamp", "gated_ReLU_no_gate_L2norm_nodivS_noclamp", "gated_softmax_out_gate_L2norm_nodivS_noclamp", "gated_softmax_post_out_gate_L2norm_nodivS_noclamp", "gated_softmax_no_gate_rmsnorm_nodivS", "gated_softmax_no_gate_customnorm", "gated_softmax_cumgate"]:
                     self.in_gate_proj = nn.Linear(config.hidden_size, config.num_key_value_heads, bias=True)
-                if self.attention_type in ["gated_softmax_no_out_gate_no_norm", "gated_softmax_no_in_gate_no_norm", "gated_softmax_no_norm", "gated_softmax_no_gate_no_norm", "gated_softmax_cumgate"]:
+                if self.attention_type in ["gated_softmax_no_out_gate_no_norm", "gated_softmax_no_in_gate_no_norm", "gated_relu_no_in_gate_no_norm", "gated_softmax_no_norm", "gated_softmax_no_gate_no_norm", "gated_softmax_cumgate"]:
                     self.out_norm = nn.Identity()
-                elif self.attention_type in ["gated_softmax_no_gate_L2norm_nodivS"]:
+                elif self.attention_type in ["gated_softmax_no_gate_L2norm_nodivS", "gated_softmax_no_gate_L2norm_nodivS_noclamp", "gated_ReLU_no_gate_L2norm_nodivS_noclamp", "gated_softmax_out_gate_L2norm_nodivS_noclamp", "gated_softmax_post_out_gate_L2norm_nodivS_noclamp"]:
                     class L2Norm(nn.Module):
                         def __init__(self,):
                             super().__init__()
@@ -465,12 +478,12 @@ class LlamaAttention(nn.Module):
                     D_has_hdim = True,
                     use_mem_eff_path=False,
                     
-                    A_proj=False,
-                    no_dt=True,
-                    no_D_gate=True,
-                    no_z_norm=True,
+                    A_proj=True,
+                    no_dt=False,
+                    no_D_gate=False,
+                    no_z_norm=False,
                     no_in_conv=True,
-                    rmsnorm=False,
+                    rmsnorm=True,
                     expand=1,    # Block expansion factor
                 )
 
@@ -555,7 +568,7 @@ class LlamaAttention(nn.Module):
                 key_states,
                 value_states,
                 attention_mask,
-                dropout=0.0 if not self.training else self.attention_dropout,
+                dropout=0.0,
                 scaling=self.scaling,
                 **kwargs,
             )
@@ -598,6 +611,7 @@ class LlamaAttention(nn.Module):
         elif self.attention_type in [
                 "softmax_clamp_denom",
                 "softmax_detach_denom",
+                "softmax_divs"
             ]:
             def forwrd_gated(query_states, key_states, value_states, attention_mask):
                 # Inner product
@@ -615,6 +629,8 @@ class LlamaAttention(nn.Module):
                     denom = denom.clamp(min=1)
                 elif self.attention_type == "softmax_detach_denom":
                     denom = denom.clamp(min=1).detach()
+                elif self.attention_type == "softmax_divs":
+                    denom = (attention_mask==0).sum(-1, keepdim=True)
                 attn_weights = attn_weights / denom
 
                 # Output gate
@@ -626,7 +642,7 @@ class LlamaAttention(nn.Module):
 
 
 
-        elif self.attention_type in ["softmax_detach_denom_gate", "softmax_divS_gate"]:
+        elif self.attention_type in ["softmax_detach_denom_gate", "softmax_gate", "softmax_divS_gate", "softmax_divS_gatev2"]:
             # Get extra gates
             out_gate = self.out_gate_proj(hidden_states).mT[:, :, :, None].sigmoid()
 
@@ -636,18 +652,26 @@ class LlamaAttention(nn.Module):
                 # Inner product
                 attn_weights = query_states.float() @ key_states.mT.float() / math.sqrt(self.head_dim)
 
-                # Add mask
-                attn_weights = attn_weights + attention_mask
-
                 # Exponential
-                attn_weights = attn_weights.exp()
+                attn_weights = attn_weights.clamp(max=5).exp()
+
+                # Add mask
+                causal_mask = (attention_mask.clone()==0)
+                attn_weights = attn_weights * causal_mask
 
                 # Denominator
                 if self.attention_type == "softmax_detach_denom_gate":
-                    denom = attn_weights.sum(-1, keepdim=True).detach()
+                    denom = attn_weights.sum(-1, keepdim=True).detach() + 1e-4
+                elif self.attention_type == "softmax_gate":
+                    denom = torch.ones_like(attn_weights)
                 elif self.attention_type == "softmax_divS_gate":
-                    denom = (attention_mask==0).sum(-1, keepdim=True)
-                attn_weights = attn_weights / denom.clamp(min=1)
+                    denom = causal_mask.sum(-1, keepdim=True)
+                elif self.attention_type == "softmax_divS_gatev2":
+                    # This just applies the gate directly on the weights
+                    # instead of after.
+                    attn_weights = (attn_weights * out_gate.float()) / causal_mask.sum(-1, keepdim=True)
+                    return (attn_weights @ value_states.float()).to(dtype)
+                attn_weights = attn_weights / denom#.clamp(min=1)
 
                 # Output and gate
                 return ((attn_weights @ value_states.float()) * out_gate.float()).to(dtype)
@@ -688,10 +712,15 @@ class LlamaAttention(nn.Module):
                 "gated_softmax_no_out_gate", 
                 "gated_softmax_no_out_gate_no_norm",
                 "gated_softmax_no_in_gate_no_norm",
+                "gated_relu_no_in_gate_no_norm",
                 "gated_softmax_no_gate",
                 "gated_softmax_no_gate_rmsnorm",
                 "gated_softmax_no_gate_rmsnorm_nodivS",
                 "gated_softmax_no_gate_L2norm_nodivS",
+                "gated_softmax_no_gate_L2norm_nodivS_noclamp",
+                "gated_ReLU_no_gate_L2norm_nodivS_noclamp",
+                "gated_softmax_out_gate_L2norm_nodivS_noclamp",
+                "gated_softmax_post_out_gate_L2norm_nodivS_noclamp",
                 "gated_softmax_no_gate_customnorm",
                 "gated_softmax_no_gate_no_norm",
                 "gated_softmax_plusplus",
@@ -753,11 +782,11 @@ class LlamaAttention(nn.Module):
 
             #"""
             # Get extra gates
-            if self.attention_type not in ["gated_softmax_no_out_gate", "gated_softmax_no_out_gate_no_norm", "gated_softmax_no_gate", "gated_softmax_no_gate_rmsnorm", "gated_softmax_no_gate_L2norm_nodivS", "gated_softmax_no_gate_rmsnorm_nodivS", "gated_softmax_no_gate_no_norm", "gated_softmax_no_gate_customnorm"]:
+            if self.attention_type not in ["gated_softmax_no_out_gate", "gated_softmax_no_out_gate_no_norm", "gated_softmax_no_gate", "gated_softmax_no_gate_rmsnorm", "gated_softmax_no_gate_L2norm_nodivS", "gated_softmax_no_gate_L2norm_nodivS_noclamp", "gated_ReLU_no_gate_L2norm_nodivS_noclamp", "gated_softmax_no_gate_rmsnorm_nodivS", "gated_softmax_no_gate_no_norm", "gated_softmax_no_gate_customnorm"]:
                 out_gate = self.out_gate_proj(hidden_states).mT[:, :, :, None].sigmoid()
             else:
                 out_gate = torch.ones_like(query_states)[:, :, :, :1]
-            if self.attention_type not in ["gated_softmax_no_in_gate", "gated_softmax_no_in_gate_no_norm", "gated_softmax_no_gate", "gated_softmax_no_gate_rmsnorm", "gated_softmax_no_gate_L2norm_nodivS", "gated_softmax_no_gate_rmsnorm_nodivS", "gated_softmax_no_gate_no_norm", "gated_softmax_no_gate_customnorm"]:
+            if self.attention_type not in ["gated_softmax_no_in_gate", "gated_softmax_no_in_gate_no_norm", "gated_relu_no_in_gate_no_norm", "gated_softmax_no_gate", "gated_softmax_no_gate_rmsnorm", "gated_softmax_no_gate_L2norm_nodivS", "gated_softmax_no_gate_L2norm_nodivS_noclamp", "gated_ReLU_no_gate_L2norm_nodivS_noclamp", "gated_softmax_out_gate_L2norm_nodivS_noclamp", "gated_softmax_post_out_gate_L2norm_nodivS_noclamp", "gated_softmax_no_gate_rmsnorm_nodivS", "gated_softmax_no_gate_no_norm", "gated_softmax_no_gate_customnorm"]:
                 in_gate = self.in_gate_proj(hidden_states).mT[:, :, :, None].sigmoid()
             else:
                 in_gate = torch.ones_like(value_states)[:, :, :, :1]
@@ -768,9 +797,19 @@ class LlamaAttention(nn.Module):
                 value_states = value_states * in_gate
 
                 dtype = query_states.dtype
-                attn_weights = torch.matmul(query_states.float(), key_states.float().transpose(2, 3)) / math.sqrt(self.head_dim)
+                if self.attention_type in ["gated_ReLU_no_gate_L2norm_nodivS_noclamp", "gated_relu_no_in_gate_no_norm"]:
+                    attn_weights = torch.matmul(query_states.float().relu(), key_states.float().transpose(2, 3).relu()) / math.sqrt(self.head_dim)
+                else:
+                    attn_weights = torch.matmul(query_states.float(), key_states.float().transpose(2, 3)) / math.sqrt(self.head_dim)
                 # attn_weights = attn_weights * decay_weights.mT[:, :, None, :]
-                attn_weights = attn_weights.clamp(max=5).exp()
+                if self.attention_type in ["gated_softmax_no_gate_L2norm_nodivS_noclamp", "gated_softmax_out_gate_L2norm_nodivS_noclamp", "gated_softmax_post_out_gate_L2norm_nodivS_noclamp"]:
+                    attn_weights = attn_weights.exp()
+                elif self.attention_type in ["gated_ReLU_no_gate_L2norm_nodivS_noclamp"]:
+                    pass
+                elif self.attention_type in ["gated_relu_no_in_gate_no_norm"]:
+                    attn_weights = attn_weights.clamp(max=5)
+                else:
+                    attn_weights = attn_weights.clamp(max=5).exp()
                 # attn_weights = torch.nn.functional.silu(attn_weights.clamp(max=5))
 
                 causal_mask = (attention_mask==0)
@@ -780,7 +819,7 @@ class LlamaAttention(nn.Module):
 
                 # Output gate
                 # attn_output = self.out_norm(attn_output)
-                if self.attention_type in ["gated_softmax_no_gate_L2norm_nodivS", "gated_softmax_no_gate_rmsnorm_nodivS"]:
+                if self.attention_type in ["gated_softmax_no_gate_L2norm_nodivS", "gated_softmax_no_gate_rmsnorm_nodivS", "gated_softmax_no_gate_L2norm_nodivS_noclamp", "gated_ReLU_no_gate_L2norm_nodivS_noclamp"]:
                     return out_gate * torch.matmul(attn_weights, value_states.float()).to(dtype)
                 return out_gate * torch.matmul(attn_weights, value_states.float()).to(dtype) / causal_mask.sum(-1, keepdim=True)
 
@@ -789,6 +828,10 @@ class LlamaAttention(nn.Module):
             )
 
             attn_output = self.out_norm(attn_output)
+
+            # Apply after
+            if self.attention_type == "gated_softmax_post_out_gate_L2norm_nodivS_noclamp":
+                attn_output = attn_output * out_gate
             #"""
 
 
