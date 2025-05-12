@@ -1,98 +1,153 @@
-# Cottention_Transformer
+# On the Expressiveness of Softmax Attention: A Recurrent Neural Network Perspective
+
+This repo is code used for experiments in the paper "On the Expressiveness of Softmax Attention: A Recurrent Neural Network Perspective".
 
 
 
 
-# Log
-## BERT
-### Initial
-Initially, both softmax and cosine did quite bad. However, cosine would not converge at all.
+# Setup
 
-### Attempting to fix Cosine Attention
-Below are the attempts at trying to fix the issue of cosine attention divergence
-- Gradient clipping - Kind of stabalized training, but was terrible
-- Higher weight decay (0.1) - Did not help at all
-- Lower learning rate (1e-5) - Appeared to stabalize training
+This repo was trained with python 3.10. Other versions may or may not work.
 
-At this point, training was tested with both softmax and cosine again, with cosine winning at 1e-5 learning rate.
+To setup, first ensure you have cuda properly setup. This can be checked by running `nvidia-smi` and `nvcc -V`.
 
-### AdamW
-After "fixing" cosine attention, it was realized that Adam was used instead of AdamW. After using AdamW, softmax at 1e-5 and 1e-4 learning rate completely destroyed cosine attention.
+Create a virtual environment with 
+```
+python -m venv GatedAttnEnv
+source GatedAttnEnv/bin/activate
+```
 
-### Improving Convergence of Cosine Attentoin
-Seeing Cosine attention converge gave us hope that it could be optimized to match normal attention
-- Slaping ReLU around the "attention" matrix - In normal ReLU fashion, this worked quite well and convergence was much faster. We hypothesize this could be because the model could "throw away" tokens when doing linear combinations with the values.
-- Other activations didn't do as well, even variations of ReLU which is probably because tokens cannot be throw away.
-- Slightly higher learning rate - Learning rates of 3e-5 and 5e-5 diverged, 1e-5 seemed to be the sweet spot.
-- Token Dropout - Dropout in the attention matrix made the model slightly worse.
-- Angle dist - Since ReLU worked, why wouldn;t the angle distance work. This is basically an unsigned variant of cosine similarity. This was much worse than cosine similarity with ReLU.
+Install the requirements
+```
+pip install -r requirements.txt
+```
 
-### Stabalizing Traning At a Higher Learning Rate
-We realized to make cosine attention match that of softmax, the learning rate must be increased. Since ReLU was so good, why not have it do a little better
-- Learning ReLU - Can ReLU do better if parts of it such as the slope or cutoff are learned? Apparently not as this makes the model worse.
-- "Soft ReLU" - We noticed several of the attention maps using ReLU were dead. This is a variant on ReLU where the forward pass is normal ReLU, but backward pass is leaky ReLU, thus creating some intermediate between leaky and normal ReLU. This didn't work :(
-
-### Measuring Magnitude
-What's the one thing attention has over the current method? The magnitude of attention is at most 1. The magnitude of cosine similarity is at most the number of tokens in the sequence. This must blow up the output values if the attention map has large values.
-
-Looking at the magnitude of the cosine scores makes it obvious that this is the problem. The magnitudes continuously increase as training goes on, reaching values of above 10.
-
-### Fixing Magnitude Issues
-Fixing this issue is quite easy, just normalize the attention matrix. To do this, we can divide by the sequence length. This means the magnitude will never be greater than 1. Doing this fixes the problem. The model can now be trained at a high learning rate and this method also beats ReLU at 1e-5 learning rate.
-
-The best part is this method has linearity:
-
-(N(Q)@N(K^T))/s @ V = N(Q)@N(K^T)) @ V/s = N(Q) @ (N(K^T) @ V/s)
-
-### Fixing Magnitude Issues 2
-The old method works well where the attention scores are divided by the sequence length, however this leads to a problem. If the cosine similarity scores of the sequence are < 1, then the outputs will slowely converge to 0 as the number of layers increases. Alternatively, if the scroes of the sequence are > 1, then the outputs will quickly diverge and go to infinity. The current situation is much better than going to infinity, however it is far from optimal.
-
-How about we take an exponential of the sequence length? So instead the sequence is divided by the square root of the sequence length. This works and the model does slightly better, however this diverges at a point, likely as the model has magnitudes > 1.
-
-How about allowing the model to learn an exponential of the sequence length. In this case, the attention scoes will be divided by the sequence length to the power of a learnable constant (one for each head). This seems to work quite well, however rarely this method also dies and goes to infinity. FOrcing the model to have a value between 0 and 1 via sigmoid helps, but still runs into divergence problems.
-
-How about just normalizing the values. So the output becomes: O = N(Q) @ N(K^T) @ N(V). Maybe this will helps. It's kind of like just messing around the unit sphere though.
-
-How about adding a penalty to the loss? For example we could:
-1. Penalize the output of the attention mechanism for have output tokens with high magnitude from the values. Note that instead of doing this for the input, we do this with the values. The Q and K are just going to be between -1 and 1, so that magnitude doesn't matter. The magnitude of the values on the other hand should be close to the magnitude of the output so the model doesn't blow up. This means token 0 in the values should have a magnitude close to token 0 in the output
-2. A slightly less extreme penalty is that the average magnitude of the values should be close to the average magnitude of the output.
-- In the end, penalty wouldn't covnerge at all :(
-
-What worked best?
-- Although dividing by a constant worked most of the time, it failed sometimes. Normalizing the values worked for all tests so far.
-
-
-## Data Problems
-Training the above was trained on data without punctuation as the data script removed these by mistake. Adding them back results in proper data. Additionally, this data had a few problems, which were addressed to clean the data further and properly.
-
-## Fixing Stability
-With the new data, the stability becomes wacky again. The value norm method dies because the magnitude of the vectors becomes too large. The norm method worked for the other data likely because that data had much shorter sentences. However, as the sentence size grows, the magnitude of the attention row vectors increases as the max magnitude is the sequence length itself. This results in an unstable behavior, as the number of layer increases, the magnitude of the vectors increases if the attention vectors have a magnitude greater than 1, which is very likely. This magnitude issue results in unstable values and unstable and large gradients.
-
-To fix this, we are going back to the divide by the sequence lenght method for now. This method will obviously fix the magnitude issue in all cases, however, the model may hae issues as the scores could decrease to 0 instead of increasing to infinity, which is a much better problem. We will see how this works out. 
-
-I am afraid that this method may result in long sequence issue. Let's say we have a sequence of length S and we increase the sequence to 2S. Let's say that the addition of S tokens doesn't add any attention scores as perhaps we addeed some trash token the model doesn't care about. Then, the attention scores are divided by two, which may cause vanishing values as layers are stacked. I am thinking that since information among tokens is sparse, as the sequence length increases, the attention scores will have issues. Just a hypothesis, not sure if this is actually a problem or not.
+Then, install the version of torch for your system at `https://pytorch.org/get-started/locally/`. This repo was run on torch `2.6.0` with cuda `11.8`. Your system will likely need to use a different version of cuda. The following command install torch `2.6.0` for cuda `11.8`:
+```
+pip install torch==2.6.0 --index-url https://download.pytorch.org/whl/cu118
+```
 
 
 
-## GPT
+
+
+# Running the script
+
+The script can be run with the following:
+
+```
+torchrun --nproc_per_node=1 --master-port $PORT GPT_Trainer/train.py
+```
+
+where $PORT is just an arbitrary open port number.
 
 
 
-# Tests
-## Activation Functions
-Try different activations functions on the attention matrix:
-- ReLU
-- Sigmoid
-- Softmax???
+
+# Important Scripts
+
+Almost everything can be controlled from the `train.py` script. The following parameters are adjustable:
+- `batch_size` - Global batch size across all GPUs. A batch size of 36 across 2 GPUs would mean a batch size of 18 on each GPU.
+- `learning_rate` - Model learning rate
+- `warmup_steps` - Number of steps to linearly increase the learning rate from 0 to `learning_rate`. After the number of steps reaches `warmup_steps`, the learning rate is linearly decreased to 0 and will hit 0 once `num_steps` update steps has been reached.
+- `num_steps` - Total number of steps the model will be trained for.
+- `num_steps_early_stop` - Stops the model early at this many steps. The learning rate scheduler is not changed.
+- `dev` - Keep this at `gpu`
+- `wandb_name` - Wandb will log the run under this name. Note that the project is defaulted to `Gated_Attention`
+- `log_steps` - Wandb will log the model loss every `log_steps` number of steps
+- `use_amp` - True to use AMP with bfloat16, False to stay in float32
+- `attention_type` - Type of attention this model will use. All types can be found in the `LlamaDecoderLayer.py` script. The useful options are mentioned below.
+- `dataset` - Name of the dataset to load in. Can be one of `gmongaras/EleutherAI_the_pile_deduplicated`, `gmongaras/SlimPajama-627B_Reupload`, `HuggingFaceFW/fineweb`.
+- `mlp_type` - THe MLP type to use. We stick with `normal` which uses the normal, gated MLP block in llama. `gelu` swaps this with a GELU MLP without a gate.
+- `clipping_value` - `None` for no clipping, a float value to perform gradient clipping with said value.
+- `weight_decay` - Normal optimizer weight decay param
+- `model_save_path` - Local path to save model checkpoints to
+- `num_save_steps` - Every `num_save_steps`, the current model will be saved along with the states of the optimizer and scheduler.
+- `keep_dataset_in_mem` - Keep this `False`
+- `model_max_length` - The max number of tokens to train the model with.
+- `test_per` - Percentage of data to make test data.
+- `num_steps_test` - Every `num_steps_test`, the model will stop trained, will iterate over all test data, and calculate metrics logged to wandb.
+- `model_size` - `small` for the small model (~300 million params), `large` for the large model (~2 billion params).
+- `test_loss` - `True` to test the model on test data, `False` to skip this and just train the model.
+
+The base model is llama 2. We just swap out the blocks with custom blocks. The code for these blocks can be found in the `LlamaDecoderLayer.py` script. Additionally, this script has all the `attention_type` options.
+
+The training actually happens in `Trainer.py`.
+
+To test models, `infer.py` can perform inference using pretrained models. However the script is very unoptimized and is only used for testing purposes.
 
 
-## Similarity Scoring
-Try different similarity measures to obtain the attention matrix:
-- Cosine similarity - cosFormer/cottention
-- Euclidean distance - Euclidformer
-- Manhattan distance - ManFormer?
+
+# Experiment Info
+
+Unless otherwise mentioned, the below are the parameters we used in our models. As our base model is llama 2, RoPE is used on the attention matrix and the MLPs follow SwiGLU.
+
+- batch size - 36
+- learning rate - 1e-4
+- warmup steps - 10,000
+- warmup type - linear warmup from 0, linear decay
+- num steps - 1,000,000
+- num steps early stop - 100,000
+- AMP - enabled
+- Weight decay - 0.01
+- Max sequence length - 1024 for general experimetns, 4096 for the 4096 length experiment
+- Test percentage - 0.001
+- Optimizer - AdamW
+- Adam betas - 0.9 and 0.999
+- Hidden size - 1024 (3072 for the large model)
+- MLP intermediate size - 2048 (6144 for the large model)
+- Num attention heads - 16
+- Num hidden layers - 20
+- Tokenizer - llama2-7b-hf
+- Gradient clipping - 1.0 clipping for gated models, no clipping for all other experiments
+\end{enumerate}
+
+Each model was trained for a maximum of 2 days. Most experiments, we use distributed data parallel to train on two 80 GB, A100 GPUs with the exception of the large model, trained on 4 GPUs, and 4096 sequence length, trained on 6 GPUs.
+
+Note that `output gate` refers to a gate on the attention output or along the queries/columns of the attention matrix (both are equivalent mathematically). An `input gate` refers to a gate on the values or along the rows of the attention matrix (both are equivalent mathematically).
+
+Most expierments are controlled by the `attention_type` parameter. All experimented Below are descriptions of the useful options for this parameter:
+- `softmax` - Normal SDPA using basic softmax.
+- `softmax_clamp_denom` - Softmax, but clamp the denominator to be >= 1
+- `softmax_detach_denom` - Softmax, but detach the denominator.
+- `softmax_detach_denom_gate` - Softmax, but detach the denominator and add a learnable output gate.
+- `softmax_divs` - Softmax, but replace the denominator by dividing by the sequence length.
+- `softmax_gate` - Softmax, but replace the denominator with an output gate
+- `softmax_divS_gate` - Combines both `softmax_divs` and `softmax_gate`. Softmax without a denominator, repalced with an output gate and dividing by the sequence length.
+- `softmax_divS_gatev2` - Same as `softmax_divS_gate`, but the output gate is applied on the attention matrix rather than the attention output. Should be mroe numerically stable.
+- `softmax_divS_norm` - Softmax, but replace the denominator with a RMSNorm.
+- `softmax_taylor_80terms` - Softmax decomposed as a taylor series of 80 terms
+- `gated_softmax` - Softmax, no denominator, both an input and output gate, divide by the sequence length, and an output LayerNorm.
+- `gated_softmax_no_norm` - Same as `gated_softmax`, but no norm. So only gates and divde by the sequence length.
+- `gated_softmax_no_in_gate` - Same as `gated_softmax`, but no input gate. So an output gate, a norm and divde by the sequence length.
+- `gated_softmax_no_out_gate` - Same as `gated_softmax`, but no output gate. So an input gate, a norm and divde by the sequence length.
+- `gated_softmax_no_out_gate_no_norm` - Same as `gated_softmax`, but no output gate and no norm. So an input gate and divde by the sequence length.
+- `gated_softmax_no_in_gate_no_norm` - Same as `gated_softmax`, but no input gate and no norm. So an output gate and divde by the sequence length. This is the same as `softmax_gate`.
+- `gated_relu_no_in_gate_no_norm` - Similar to `gated_softmax`, but no input gate and no norm and ReLU linear attention is used. So the exponential is replaced by a ReLU kernel, an output gate is used and divde by the sequence length.
+- `gated_softmax_no_gate` - Same as `gated_softmax` but without an input or output gate. So just LayerNorm and divide by the sequence length.
+- `gated_softmax_no_gate_rmsnorm` - Same as `gated_softmax_no_gate` but with RMSNorm instead of LayerNorm.
+- `gated_softmax_no_gate_L2norm_nodivS` - Same as `gated_softmax_no_gate` but with L2Norm instead of LayerNorm and no division by S.
+- `gated_softmax_no_gate_L2norm_nodivS_noclamp` - Same as `gated_softmax_no_gate_L2norm_nodivS` but the inner product is not clamped. Essentially, this is just Norm(exp(QK)V)
+- `gated_ReLU_no_gate_L2norm_nodivS_noclamp` - Same as `gated_softmax_no_gate_L2norm_nodivS_noclamp` but replace the inner product with a ReLU kernel. This is essentially Norm(relu(Q)relu(K)V)
+- `gated_softmax_out_gate_L2norm_nodivS_noclamp` - Same as `gated_softmax_no_gate_L2norm_nodivS_noclamp`, but an output gate is added.
+- `gated_softmax_post_out_gate_L2norm_nodivS_noclamp` - Same as `gated_softmax_no_gate_L2norm_nodivS_noclamp` but an output gate is added after the norm.
+- `gated_softmax_no_gate_rmsnorm_nodivS` - Same as `gated_softmax_no_gate_rmsnorm`, but no division by the sequence length.
+- `gated_softmax_no_gate_no_norm` - Softmax without a gate or a norm, just divison by the sequence length. This is essentially (exp(QK)V)/S.
+- `linear_elu` - Linear attention with elu(x) + 1 as the activation function
+- `linear_relu` - Linear attention with relu(x) as the activation function
+- `linear_cosine` - Linear attention with L2Norm(X) as the activation function
 
 
-## Learnable Similarity?
-What if we have the model learn the similarity function?
-- Ex: learnable Chebyshev p value.
+Note that most of these expierments clamped the inner product to be no greater than 5, before the exponential. If a value is too large, it will be clamped to prevent numerical instability. We notice this doesn't hurt performance and helps to stabalize experiments without a norm.
+
+
+
+
+# Datasets
+
+The fineweb dataset was used for most expierments. We specifically use the "CC-MAIN-2024-51" version of this dataset. The Pile and SlimPajama were also used and have been reuploaded to utilize faster loading speeds of the more recent huggingfae library.
+- [fineweb](https://huggingface.co/datasets/HuggingFaceFW/fineweb/viewer/CC-MAIN-2024-51)
+- [The Pile (Reuploaded)](https://huggingface.co/datasets/gmongaras/EleutherAI_the_pile_deduplicated)
+- [The Pile (Original)](https://huggingface.co/datasets/EleutherAI/pile)
+- [SlimPajama (Reuplaoded)](https://huggingface.co/datasets/gmongaras/SlimPajama-627B_Reupload)
+- [SlimPajama (Original)](https://huggingface.co/datasets/cerebras/SlimPajama-627B)

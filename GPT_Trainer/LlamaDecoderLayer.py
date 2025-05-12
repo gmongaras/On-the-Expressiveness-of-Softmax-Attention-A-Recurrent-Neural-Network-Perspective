@@ -16,16 +16,12 @@ from transformers.utils import (
     logging,
 )
 from transformers.models.llama.configuration_llama import LlamaConfig
-from kernel.Gated_Attn import GatedAttention
 import math
 from torch.utils.checkpoint import checkpoint
-# https://github.com/state-spaces/mamba/issues/706
-from mamba_ssm import Mamba2
-from mamba_test.Mamba2 import Mamba2_SM
-from einops import rearrange
-from mamba_test.mamba_softmax import Mamba2Block_SM, Mamba2Config
 # from transformers.models.mamba2.modeling_mamba2 import Mamba2Block as Mamba2Block_SM
 # from transformers.models.mamba2.modeling_mamba2 import Mamba2Config
+
+from einops import rearrange
 
 
 
@@ -445,6 +441,11 @@ class LlamaAttention(nn.Module):
                 self.norm_const = nn.Parameter(0.5*torch.ones(1, config.num_attention_heads, 1, 1, dtype=self.q_proj.weight.dtype)).to(self.q_proj.weight.device)
 
         else:
+            # https://github.com/state-spaces/mamba/issues/706
+            from mamba_ssm import Mamba2
+            from mamba_test.Mamba2 import Mamba2_SM
+            from mamba_test.mamba_softmax import Mamba2Block_SM, Mamba2Config
+
             if self.attention_type == "linear_mamba":
                 self.mamba_layer = Mamba2(
                     # This module uses roughly 3 * expand * d_model^2 parameters
