@@ -250,7 +250,7 @@ def eager_attention_forward(
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: LlamaConfig, layer_idx: int):
+    def __init__(self, config: LlamaConfig, layer_idx: int, get_taylor_terms=False):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
@@ -261,6 +261,13 @@ class LlamaAttention(nn.Module):
         self.is_causal = True
         self.attention_type = config.attention_type
         self.no_rope = False
+        
+        # Used to test the taylor values during inference
+        self.get_taylor_terms = get_taylor_terms
+        if get_taylor_terms:
+            assert self.attention_type in ["softmax", "linear_elu", "linear_relu", "linear_cosine"]
+            self.num_iters = 100
+            self.avg_mags = [[] for i in range(0, self.num_iters)]
 
         self.abs_pos_enc = AbsolutePositionalEncoding(config.hidden_size, max_len=1024, dropout=0.0)
 
@@ -574,6 +581,29 @@ class LlamaAttention(nn.Module):
                 **kwargs,
             )
             attn_output = attn_output.transpose(1, 2)
+
+
+            if self.get_taylor_terms:
+                attention_mask = torch.triu(torch.ones(1, 1, input_shape[-1], input_shape[-1])).mT.to(query_states.device).to(query_states.dtype)
+
+                # Inner product
+                attn_weights = query_states @ key_states.mT / math.sqrt(self.head_dim)
+
+                # SUbtract max for stability
+                # attn_weights = attn_weights - attn_weights.max(-1, keepdims=True).values
+                # mask_ = (attention_mask == 0).to(query_states.device)
+                attn_weights = (attn_weights * attention_mask).to(torch.float64)
+
+                # Exponential
+                attn_weights_ = attn_weights.clone() + 1
+                cur = torch.tensor([1], dtype=torch.float64).to(query_states.device)
+                self.avg_mags[0].append(torch.tensor(1, dtype=torch.float64))
+                self.avg_mags[1].append((attn_weights * attention_mask).mean())
+                for i in range(2, self.num_iters):
+                    cur *= i
+                    c = (attn_weights**i)/cur
+                    attn_weights_ = attn_weights_ + c
+                    self.avg_mags[i].append((c*attention_mask).abs().mean())
 
 
         elif self.attention_type in [
@@ -993,8 +1023,26 @@ class LlamaAttention(nn.Module):
                 attn_weights = query_states @ key_states.mT
 
                 # Mask
-                causal_mask = (attention_mask==0)
+                if self.training:
+                    causal_mask = (attention_mask==0)
+                else:
+                    causal_mask = torch.triu(torch.ones(1, 1, input_shape[-1], input_shape[-1])).mT.to(query_states.device).to(query_states.dtype)
                 attn_weights = attn_weights * causal_mask
+
+
+
+                if self.get_taylor_terms:
+                    attn_weights_ = (attn_weights * causal_mask).to(torch.float64)
+                    # Exponential
+                    attn_weights_ = attn_weights_.clone() + 1
+                    cur = torch.tensor([1], dtype=torch.float64).to(query_states.device)
+                    self.avg_mags[0].append(torch.tensor(1, dtype=torch.float64))
+                    self.avg_mags[1].append((attn_weights * causal_mask).mean())
+                    for i in range(2, self.num_iters):
+                        cur *= i
+                        c = (attn_weights**i)/cur
+                        attn_weights_ = attn_weights_ + c
+                        self.avg_mags[i].append((c*causal_mask).abs().mean())
 
                 # Denominator
                 attn_weights = attn_weights / attn_weights.sum(-1, keepdim=True)
@@ -1021,8 +1069,24 @@ class LlamaAttention(nn.Module):
                 attn_weights = query_states @ key_states.mT
 
                 # Mask
-                causal_mask = (attention_mask==0)
+                if self.training:
+                    causal_mask = (attention_mask==0)
+                else:
+                    causal_mask = torch.triu(torch.ones(1, 1, input_shape[-1], input_shape[-1])).mT.to(query_states.device).to(query_states.dtype)
                 attn_weights = attn_weights * causal_mask
+
+                if self.get_taylor_terms:
+                    attn_weights_ = (attn_weights * causal_mask).to(torch.float64)
+                    # Exponential
+                    attn_weights_ = attn_weights_.clone() + 1
+                    cur = torch.tensor([1], dtype=torch.float64).to(query_states.device)
+                    self.avg_mags[0].append(torch.tensor(1, dtype=torch.float64))
+                    self.avg_mags[1].append((attn_weights * causal_mask).mean())
+                    for i in range(2, self.num_iters):
+                        cur *= i
+                        c = (attn_weights**i)/cur
+                        attn_weights_ = attn_weights_ + c
+                        self.avg_mags[i].append((c*causal_mask).abs().mean())
 
                 # Denominator
                 attn_weights = attn_weights / (attn_weights.sum(-1, keepdim=True) + 1e-8)
@@ -1043,13 +1107,29 @@ class LlamaAttention(nn.Module):
                 key_states = torch.nn.functional.normalize(key_states)
 
                 # Get binary mask
-                causal_mask = (attention_mask==0)
+                if self.training:
+                    causal_mask = (attention_mask==0)
+                else:
+                    causal_mask = torch.triu(torch.ones(1, 1, input_shape[-1], input_shape[-1])).mT.to(query_states.device).to(query_states.dtype)
 
                 # Scale value
                 value_states = value_states / ((causal_mask).sum(-1, keepdims=True)**self.norm_const.sigmoid())
 
                 # Inner product
                 attn_weights = (query_states @ key_states.mT) * causal_mask
+
+                if self.get_taylor_terms:
+                    attn_weights_ = (attn_weights * causal_mask).to(torch.float64)
+                    # Exponential
+                    attn_weights_ = attn_weights_.clone() + 1
+                    cur = torch.tensor([1], dtype=torch.float64).to(query_states.device)
+                    self.avg_mags[0].append(torch.tensor(1, dtype=torch.float64))
+                    self.avg_mags[1].append((attn_weights * causal_mask).mean())
+                    for i in range(2, self.num_iters):
+                        cur *= i
+                        c = (attn_weights**i)/cur
+                        attn_weights_ = attn_weights_ + c
+                        self.avg_mags[i].append((c*causal_mask).abs().mean())
 
                 # Output gate
                 return attn_weights @ value_states
@@ -1088,11 +1168,11 @@ class LlamaAttention(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config: LlamaConfig, layer_idx: int):
+    def __init__(self, config: LlamaConfig, layer_idx: int, get_taylor_terms=False):
         super().__init__()
         self.hidden_size = config.hidden_size
 
-        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
+        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx, get_taylor_terms=get_taylor_terms)
 
         self.mlp = LlamaMLP(config)
         self.input_layernorm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)

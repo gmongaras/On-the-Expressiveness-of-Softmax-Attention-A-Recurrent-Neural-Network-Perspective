@@ -244,8 +244,34 @@ class Trainer():
                     "vocab_size": self.tokenizer.vocab_size,
                     "attention_type": attention_type,
                 }))
+            elif model_size == "large_depth":
+                self.model = transformers.LlamaForCausalLM(config=transformers.LlamaConfig.from_dict({
+                    "_name_or_path": "meta-llama/Llama-2-7b-hf",
+                    "architectures": [
+                        "LlamaForCausalLM"
+                    ],
+                    "bos_token_id": 1,
+                    "eos_token_id": 2,
+                    "hidden_act": "silu",
+                    "hidden_size": 1024, #4096,
+                    "initializer_range": 0.02,
+                    "intermediate_size": 1024*2, # 11008
+                    "max_position_embeddings": model_max_length,
+                    "model_type": "llama",
+                    "num_attention_heads": 32,
+                    "num_hidden_layers": 60,
+                    "num_key_value_heads": 32,
+                    "pretraining_tp": 1,
+                    "rms_norm_eps": 1e-05,
+                    "rope_scaling": None,
+                    "tie_word_embeddings": False,
+                    "torch_dtype": "float16",
+                    "use_cache": True,
+                    "vocab_size": self.tokenizer.vocab_size,
+                    "attention_type": attention_type,
+                }))
             else:
-                raise RuntimeError(f"Model size must be small or large, but got {model_size}")
+                raise RuntimeError(f"Model size must be small or large or large_depth, but got {model_size}")
             
             
             # Replace all self attention layers with the cosine attention layer
