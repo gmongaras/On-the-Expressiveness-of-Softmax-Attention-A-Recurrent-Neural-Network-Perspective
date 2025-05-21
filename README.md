@@ -142,6 +142,10 @@ Note that most of these expierments clamped the inner product to be no greater t
 
 
 
+All experiments are logged [in wandb](https://wandb.ai/gmongaras1/Gated_Attention/workspace?nw=nwusergmongaras)
+
+
+
 
 # Datasets
 
