@@ -100,7 +100,6 @@ Unless otherwise mentioned, the below are the parameters we used in our models. 
 - Num hidden layers - 20
 - Tokenizer - llama2-7b-hf
 - Gradient clipping - 1.0 clipping for gated models, no clipping for all other experiments
-\end{enumerate}
 
 Each model was trained for a maximum of 2 days. Most experiments, we use distributed data parallel to train on two 80 GB, A100 GPUs with the exception of the large model, trained on 4 GPUs, and 4096 sequence length, trained on 6 GPUs.
 
