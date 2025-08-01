@@ -1,5 +1,7 @@
 # On the Expressiveness of Softmax Attention: A Recurrent Neural Network Perspective
 
+Paper link: [https://arxiv.org/abs/2507.23632](https://arxiv.org/abs/2507.23632)
+
 This repo is code used for experiments in the paper "On the Expressiveness of Softmax Attention: A Recurrent Neural Network Perspective".
 
 
