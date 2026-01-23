@@ -10,7 +10,7 @@ import itertools
 from multiprocessing import cpu_count
 import logging
 
-TOKEN = "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"
+TOKEN = "<your token here>"
 
 
 
