@@ -6,6 +6,7 @@ Published in TMLR [https://openreview.net/forum?id=PHcITOi3vV](https://openrevie
 
 This repo is code used for experiments in the paper "On the Expressiveness of Softmax Attention: A Recurrent Neural Network Perspective".
 
+Got a bunch of random notes [here](https://docs.google.com/document/d/1XUMWA9Hh7IsKyaCh3Tovg4AewRH4MJmbHrX1iuQWKnA/edit?tab=t.0)
 
 
 
